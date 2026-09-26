@@ -153,6 +153,19 @@ impl InputEmulation {
         }
     }
 
+    /// Place the cursor at `(x, y)`, given as fractions of the whole desktop:
+    /// `(0, 0)` is the top-left corner and `(1, 1)` the bottom-right one.
+    pub async fn warp(
+        &mut self,
+        handle: EmulationHandle,
+        x: f64,
+        y: f64,
+    ) -> Result<(), EmulationError> {
+        self.emulation
+            .warp(handle, x.clamp(0.0, 1.0), y.clamp(0.0, 1.0))
+            .await
+    }
+
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
@@ -234,6 +247,15 @@ trait Emulation: Send {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError>;
+    /// see [`InputEmulation::warp`]; backends that can't place the cursor ignore it
+    async fn warp(
+        &mut self,
+        _handle: EmulationHandle,
+        _x: f64,
+        _y: f64,
+    ) -> Result<(), EmulationError> {
+        Ok(())
+    }
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);

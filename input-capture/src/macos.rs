@@ -101,6 +101,19 @@ impl InputCaptureState {
         None
     }
 
+    /// Where the cursor crossed the edge at `pos`, across all displays.
+    fn crossing_fraction(&self, event: &CGEvent, pos: Position) -> u16 {
+        let location = event.location();
+        match pos {
+            Position::Left | Position::Right => {
+                crate::edge_fraction(location.y, self.bounds.ymin, self.bounds.ymax)
+            }
+            Position::Top | Position::Bottom => {
+                crate::edge_fraction(location.x, self.bounds.xmin, self.bounds.xmax)
+            }
+        }
+    }
+
     // Get the max bounds of all displays
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
@@ -519,10 +532,11 @@ fn create_event_tap<'a>(
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
                 capture_position = Some(new_pos);
+                let along = state.crossing_fraction(cg_ev, new_pos);
                 state
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
-                res_events.push(CaptureEvent::Begin);
+                res_events.push(CaptureEvent::Begin { along: Some(along) });
                 notify_tx
                     .blocking_send(ProducerEvent::Grab(new_pos))
                     .expect("Failed to send notification");

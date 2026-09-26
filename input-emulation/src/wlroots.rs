@@ -168,6 +168,26 @@ impl Emulation for WlrootsEmulation {
         Ok(())
     }
 
+    async fn warp(
+        &mut self,
+        handle: EmulationHandle,
+        x: f64,
+        y: f64,
+    ) -> Result<(), EmulationError> {
+        // Absolute motion is relative to the whole output layout, so no need
+        // to know the monitor arrangement here.
+        const EXTENT: u32 = 1 << 20;
+        let scale = |f: f64| ((f * EXTENT as f64) as u32).min(EXTENT - 1);
+        if let Some(input) = self.state.input_for_client.get(&handle) {
+            input
+                .pointer
+                .motion_absolute(now_millis(), scale(x), scale(y), EXTENT, EXTENT);
+            input.pointer.frame();
+            self.queue.flush()?;
+        }
+        Ok(())
+    }
+
     async fn create(&mut self, handle: EmulationHandle) {
         self.state.add_client(handle);
         if let Err(e) = self.queue.flush() {
@@ -185,6 +205,13 @@ impl Emulation for WlrootsEmulation {
     }
 }
 
+fn now_millis() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32
+}
+
 struct VirtualInput {
     pointer: Vp,
     keyboard: Vk,
@@ -193,10 +220,7 @@ struct VirtualInput {
 
 impl VirtualInput {
     fn consume_event(&self, event: Event) -> Result<(), ()> {
-        let now: u32 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u32;
+        let now = now_millis();
 
         match event {
             Event::Pointer(e) => {

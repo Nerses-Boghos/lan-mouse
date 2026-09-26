@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use bitflags::bitflags;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
-    CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
 };
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
@@ -285,8 +285,52 @@ fn clamp_to_screen_space(
     )
 }
 
+/// Bounding box `(min_x, min_y, max_x, max_y)` of all active displays.
+fn desktop_bounds() -> Option<(CGFloat, CGFloat, CGFloat, CGFloat)> {
+    CGDisplay::active_displays()
+        .ok()?
+        .into_iter()
+        .map(get_display_bounds)
+        .reduce(|(ax0, ay0, ax1, ay1), (bx0, by0, bx1, by1)| {
+            (ax0.min(bx0), ay0.min(by0), ax1.max(bx1), ay1.max(by1))
+        })
+}
+
 #[async_trait]
 impl Emulation for MacOSEmulation {
+    async fn warp(
+        &mut self,
+        _handle: EmulationHandle,
+        x: f64,
+        y: f64,
+    ) -> Result<(), EmulationError> {
+        let (Some(current), Some((min_x, min_y, max_x, max_y))) =
+            (self.get_mouse_location(), desktop_bounds())
+        else {
+            log::warn!("could not place cursor: display layout unavailable");
+            return Ok(());
+        };
+        let target_x = min_x + x * (max_x - min_x);
+        let target_y = min_y + y * (max_y - min_y);
+        // moving there from the current location keeps the cursor on a display
+        let (new_x, new_y) = clamp_to_screen_space(
+            current.x,
+            current.y,
+            target_x - current.x,
+            target_y - current.y,
+        );
+        match CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            CGEventType::MouseMoved,
+            CGPoint::new(new_x, new_y),
+            CGMouseButton::Left,
+        ) {
+            Ok(event) => event.post(CGEventTapLocation::HID),
+            Err(_) => log::warn!("mouse event creation failed!"),
+        }
+        Ok(())
+    }
+
     async fn consume(
         &mut self,
         event: Event,

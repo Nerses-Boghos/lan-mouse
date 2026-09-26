@@ -72,6 +72,11 @@ pub enum ProtoEvent {
     /// recognize the event type silently skip it per the
     /// forward-compat handling in the receive loop.
     Hello { commit: [u8; 8] },
+    /// Where along the entry edge `pos` the cursor crossed, sent alongside
+    /// [`ProtoEvent::Enter`]. `along` runs from 0 (top / left end of the edge)
+    /// to [`u16::MAX`] (bottom / right end). Peers that don't know this event
+    /// skip it and keep their cursor where it was.
+    CursorPosition { pos: Position, along: u16 },
 }
 
 impl Display for ProtoEvent {
@@ -93,6 +98,9 @@ impl Display for ProtoEvent {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
                 write!(f, "Hello({s})")
             }
+            ProtoEvent::CursorPosition { pos, along } => {
+                write!(f, "CursorPosition({pos}, {along})")
+            }
         }
     }
 }
@@ -112,6 +120,7 @@ pub enum EventType {
     Leave,
     Ack,
     Hello,
+    CursorPosition,
 }
 
 impl ProtoEvent {
@@ -135,6 +144,7 @@ impl ProtoEvent {
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
+            ProtoEvent::CursorPosition { .. } => EventType::CursorPosition,
         }
     }
 }
@@ -196,6 +206,10 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 }
                 Ok(Self::Hello { commit })
             }
+            EventType::CursorPosition => Ok(Self::CursorPosition {
+                pos: decode_u8(&mut buf)?.try_into()?,
+                along: decode_u16(&mut buf)?,
+            }),
         }
     }
 }
@@ -265,6 +279,10 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         encode_u8(buf, len, *b);
                     }
                 }
+                ProtoEvent::CursorPosition { pos, along } => {
+                    encode_u8(buf, len, pos as u8);
+                    encode_u16(buf, len, along);
+                }
             }
         }
         (buf, len)
@@ -284,6 +302,7 @@ macro_rules! decode_impl {
 }
 
 decode_impl!(u8);
+decode_impl!(u16);
 decode_impl!(u32);
 decode_impl!(i32);
 decode_impl!(f64);
@@ -304,6 +323,29 @@ macro_rules! encode_impl {
 }
 
 encode_impl!(u8);
+encode_impl!(u16);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_position_round_trip() {
+        let (buf, len) = ProtoEvent::CursorPosition {
+            pos: Position::Right,
+            along: 12345,
+        }
+        .into();
+        assert_eq!(len, 4);
+        match ProtoEvent::try_from(buf) {
+            Ok(ProtoEvent::CursorPosition {
+                pos: Position::Right,
+                along: 12345,
+            }) => {}
+            other => panic!("unexpected decode: {other:?}"),
+        }
+    }
+}

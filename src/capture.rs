@@ -85,6 +85,7 @@ impl Capture {
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
             conn,
+            entry_along: None,
             event_tx,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
@@ -169,6 +170,8 @@ struct CaptureTask {
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: LanMouseConnection,
+    /// where the cursor crossed into the active client, re-sent with every `Enter`
+    entry_along: Option<u16>,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
@@ -344,7 +347,8 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
-        if event == CaptureEvent::Begin {
+        if let CaptureEvent::Begin { along } = event {
+            self.entry_along = along;
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
                 .expect("channel closed");
@@ -363,7 +367,7 @@ impl CaptureTask {
         }
 
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+        if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
             self.event_tx
@@ -374,7 +378,7 @@ impl CaptureTask {
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::Begin { .. } => ProtoEvent::Enter(opposite_pos),
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
                 State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
@@ -382,7 +386,15 @@ impl CaptureTask {
             },
         };
 
-        if let Err(e) = self.conn.send(event, handle).await {
+        let mut result = self.conn.send(event, handle).await;
+        if let (ProtoEvent::Enter(pos), Some(along), Ok(())) = (event, self.entry_along, &result) {
+            result = self
+                .conn
+                .send(ProtoEvent::CursorPosition { pos, along }, handle)
+                .await;
+        }
+
+        if let Err(e) = result {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
             // Funnel through release_capture so the leave_hook

@@ -444,7 +444,10 @@ async fn do_capture_session(
                     current_pos.replace(Some(pos));
 
                     // client entered => send event
-                    event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
+                    let along = activated
+                        .cursor_position()
+                        .and_then(|c| crossing_fraction(&barriers, &pos_for_barrier_id, pos, c));
+                    event_tx.send((pos, CaptureEvent::Begin { along })).await.expect("no channel");
 
                     tokio::select! {
                         _ = notify_release.notified() => { /* capture release */
@@ -526,6 +529,28 @@ async fn release_capture(
         .set_cursor_position(Some(cursor_position));
     input_capture.release(session, release_options).await?;
     Ok(())
+}
+
+/// Where `cursor` crossed the edge formed by all barriers at `pos`,
+/// i.e. across every monitor along that side of the desktop.
+fn crossing_fraction(
+    barriers: &[ICBarrier],
+    pos_for_barrier_id: &HashMap<BarrierID, Position>,
+    pos: Position,
+    cursor: (f32, f32),
+) -> Option<u16> {
+    let vertical = matches!(pos, Position::Left | Position::Right);
+    let (start, end) = barriers
+        .iter()
+        .filter(|b| pos_for_barrier_id.get(&b.barrier_id) == Some(&pos))
+        .map(|b| {
+            let (x1, y1, x2, y2) = b.position;
+            // barrier coordinates are inclusive
+            if vertical { (y1, y2 + 1) } else { (x1, x2 + 1) }
+        })
+        .reduce(|(s1, e1), (s2, e2)| (s1.min(s2), e1.max(e2)))?;
+    let value = if vertical { cursor.1 } else { cursor.0 };
+    Some(crate::edge_fraction(value as f64, start as f64, end as f64))
 }
 
 fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> BarrierID {

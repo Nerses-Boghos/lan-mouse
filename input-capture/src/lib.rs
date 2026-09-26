@@ -35,10 +35,22 @@ mod dummy;
 
 pub type CaptureHandle = u64;
 
+/// Where `value` lies between `start` and `end` of an edge, scaled to
+/// `0..=u16::MAX` for [`CaptureEvent::Begin`].
+pub fn edge_fraction(value: f64, start: f64, end: f64) -> u16 {
+    if end <= start {
+        return 0;
+    }
+    let t = ((value - start) / (end - start)).clamp(0.0, 1.0);
+    (t * u16::MAX as f64).round() as u16
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
-    /// capture on this capture handle is now active
-    Begin,
+    /// capture on this capture handle is now active.
+    /// `along` is where the cursor crossed the edge, see [`edge_fraction`];
+    /// `None` if the backend doesn't know.
+    Begin { along: Option<u16> },
     /// input event coming from capture handle
     Input(Event),
 }
@@ -46,7 +58,7 @@ pub enum CaptureEvent {
 impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CaptureEvent::Begin => write!(f, "begin capture"),
+            CaptureEvent::Begin { .. } => write!(f, "begin capture"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
         }
     }
