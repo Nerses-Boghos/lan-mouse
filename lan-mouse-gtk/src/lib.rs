@@ -8,6 +8,7 @@ mod key_row;
 mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
+mod pair_window;
 mod window;
 
 use std::{env, process, str, sync::OnceLock};
@@ -32,7 +33,7 @@ pub(crate) fn local_commit_str() -> String {
         .to_string()
 }
 
-use lan_mouse_ipc::FrontendEvent;
+use lan_mouse_ipc::{FrontendEvent, PairStatus};
 
 use adw::Application;
 use gtk::{IconTheme, gdk::Display, glib::clone, prelude::*};
@@ -308,6 +309,24 @@ fn build_ui(app: &Application) {
                     FrontendEvent::ConnectionAttempt { fingerprint } => {
                         window.request_authorization(&fingerprint);
                     }
+                    FrontendEvent::PairRequest {
+                        fingerprint,
+                        name,
+                        code,
+                        pos,
+                    } => window.request_pairing(fingerprint, &name, &code, pos),
+                    FrontendEvent::PairUpdate { name, status, .. } => {
+                        let msg = match status {
+                            PairStatus::Waiting { code } => {
+                                format!("Pairing with {name}, code {code}")
+                            }
+                            PairStatus::Paired => format!("Paired with {name}"),
+                            PairStatus::Declined => format!("{name} declined pairing"),
+                            PairStatus::Failed(e) => format!("Pairing with {name} failed: {e}"),
+                        };
+                        window.show_toast(&msg);
+                    }
+                    FrontendEvent::Discovered(_) => {}
                     FrontendEvent::DeviceConnected {
                         fingerprint: _,
                         addr,

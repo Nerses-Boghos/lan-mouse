@@ -123,5 +123,11 @@ impl DnsTask {
 /// connection time.
 async fn resolve_hostname(hostname: &str) -> io::Result<Vec<IpAddr>> {
     let addrs = lookup_host((hostname, 0)).await?;
-    Ok(addrs.map(|sa| sa.ip()).collect())
+    // IPv6 link-local addresses (fe80::/10) are only usable together with
+    // the interface they were found on, which `IpAddr` can't carry: every
+    // connection attempt to one fails. mDNS answers routinely include them.
+    Ok(addrs
+        .map(|sa| sa.ip())
+        .filter(|ip| !matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local()))
+        .collect())
 }

@@ -9,6 +9,7 @@ use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, gdk, gio, gli
 use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter};
 
 use crate::authorization_window::AuthorizationWindow;
+use crate::pair_window::PairWindow;
 
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/de/feschber/LanMouse/window.ui")]
@@ -52,6 +53,7 @@ pub struct Window {
     pub capture_active: Cell<bool>,
     pub emulation_active: Cell<bool>,
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
+    pub pair_window: RefCell<Option<PairWindow>>,
 }
 
 #[glib::object_subclass]

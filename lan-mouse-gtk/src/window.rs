@@ -17,7 +17,7 @@ use lan_mouse_ipc::{
 
 use crate::{
     authorization_window::AuthorizationWindow, fingerprint_window::FingerprintWindow,
-    key_object::KeyObject, key_row::KeyRow,
+    key_object::KeyObject, key_row::KeyRow, pair_window::PairWindow,
 };
 
 use super::{client_object::ClientObject, client_row::ClientRow};
@@ -539,6 +539,58 @@ impl Window {
 
     pub(super) fn set_pk_fp(&self, fingerprint: &str) {
         self.imp().fingerprint_row.set_subtitle(fingerprint);
+    }
+
+    /// Ask the user to confirm a pairing request from another device.
+    pub(super) fn request_pairing(
+        &self,
+        fingerprint: String,
+        name: &str,
+        code: &str,
+        pos: Position,
+    ) {
+        if let Some(w) = self.imp().pair_window.borrow_mut().take() {
+            w.close();
+        }
+        let window = PairWindow::new(name, code, pos);
+        // The main window may be hidden (closed to the menu bar); only attach
+        // the dialog to it while it is shown, so the dialog always appears.
+        if self.is_visible() {
+            window.set_transient_for(Some(self));
+        }
+        let fp = fingerprint.clone();
+        window.connect_closure(
+            "accepted",
+            false,
+            closure_local!(
+                #[strong(rename_to = parent)]
+                self,
+                move |w: PairWindow| {
+                    w.close();
+                    parent.request(FrontendRequest::PairResponse {
+                        fingerprint: fp.clone(),
+                        accept: true,
+                    });
+                }
+            ),
+        );
+        window.connect_closure(
+            "declined",
+            false,
+            closure_local!(
+                #[strong(rename_to = parent)]
+                self,
+                move |w: PairWindow| {
+                    w.close();
+                    parent.request(FrontendRequest::PairResponse {
+                        fingerprint: fingerprint.clone(),
+                        accept: false,
+                    });
+                }
+            ),
+        );
+        window.present();
+        self.imp().pair_window.replace(Some(window));
     }
 
     pub(super) fn request_authorization(&self, fingerprint: &str) {

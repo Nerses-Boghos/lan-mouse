@@ -69,6 +69,17 @@ pub enum Position {
 }
 
 impl Position {
+    /// Where something at this position is, from the user's point of view:
+    /// "on your left", "above", ...
+    pub fn relative_phrase(&self) -> &'static str {
+        match self {
+            Position::Left => "on your left",
+            Position::Right => "on your right",
+            Position::Top => "above",
+            Position::Bottom => "below",
+        }
+    }
+
     pub fn opposite(&self) -> Self {
         match self {
             Position::Left => Position::Right,
@@ -226,6 +237,48 @@ pub enum FrontendEvent {
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
+    /// Lan Mouse devices currently visible on the local network
+    Discovered(Vec<DiscoveredPeer>),
+    /// a device asks to pair; answer with [`FrontendRequest::PairResponse`].
+    /// `pos` is where the requesting device will be relative to this one.
+    PairRequest {
+        fingerprint: String,
+        name: String,
+        code: String,
+        pos: Position,
+    },
+    /// progress of a pairing, started from either side
+    PairUpdate {
+        fingerprint: String,
+        name: String,
+        status: PairStatus,
+    },
+}
+
+/// A Lan Mouse device announced on the local network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredPeer {
+    /// sha256 certificate fingerprint, the device's identity
+    pub fingerprint: String,
+    /// display name, usually the device's host name
+    pub name: String,
+    /// resolvable host name, e.g. `macbook.local`
+    pub hostname: String,
+    pub ips: Vec<IpAddr>,
+    pub port: u16,
+    /// whether this device's fingerprint is already authorized
+    pub paired: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairStatus {
+    /// request sent, waiting for the other device; both show this code
+    Waiting {
+        code: String,
+    },
+    Paired,
+    Declined,
+    Failed(String),
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -266,6 +319,12 @@ pub enum FrontendRequest {
     UpdateLeaveHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+    /// request the list of discovered devices
+    Discover,
+    /// pair with a discovered device that will sit at `pos` relative to this one
+    Pair { fingerprint: String, pos: Position },
+    /// accept or decline a [`FrontendEvent::PairRequest`]
+    PairResponse { fingerprint: String, accept: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

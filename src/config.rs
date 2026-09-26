@@ -71,6 +71,8 @@ struct ConfigToml {
     authorized_fingerprints: Option<HashMap<String, String>>,
     /// send the clipboard along when the cursor moves to another device
     clipboard: Option<bool>,
+    /// name shown to other devices (default: the host name)
+    name: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -495,6 +497,14 @@ impl Config {
     }
 
     /// release bind for returning control to the host
+    /// the name shown to other devices, if configured
+    pub fn name(&self) -> Option<String> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.name.clone())
+            .filter(|n| !n.trim().is_empty())
+    }
+
     /// whether the clipboard follows the cursor to other devices (default: on)
     pub fn clipboard(&self) -> bool {
         self.config_toml

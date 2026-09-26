@@ -5,8 +5,8 @@ use std::{net::IpAddr, time::Duration};
 use thiserror::Error;
 
 use lan_mouse_ipc::{
-    ClientHandle, ConnectionError, FrontendEvent, FrontendRequest, IpcError, Position,
-    connect_async,
+    ClientHandle, ConnectionError, DiscoveredPeer, FrontendEvent, FrontendRequest, IpcError,
+    PairStatus, Position, connect_async,
 };
 
 #[derive(Debug, Error)]
@@ -16,6 +16,8 @@ pub enum CliError {
     ServiceNotRunning(#[from] ConnectionError),
     #[error("error communicating with service: {0}")]
     Ipc(#[from] IpcError),
+    #[error("{0}")]
+    Failed(String),
 }
 
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
@@ -50,7 +52,29 @@ enum CliSubcommand {
     /// deactivate a client
     Deactivate { id: ClientHandle },
     /// list configured clients
-    List,
+    List {
+        /// print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// list Lan Mouse devices on the local network
+    Discover {
+        /// print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// pair with a device on the local network, placing it at `pos`
+    Pair {
+        /// name, host name or fingerprint (prefix) of the device, see `discover`
+        device: String,
+        pos: Position,
+    },
+    /// accept a pairing request (fingerprint as shown with the request)
+    PairAccept { fingerprint: String },
+    /// decline a pairing request
+    PairDecline { fingerprint: String },
+    /// print service events as JSON lines until interrupted
+    Watch,
     /// change hostname
     SetHost {
         id: ClientHandle,
@@ -124,10 +148,14 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::Deactivate { id } => {
             tx.request(FrontendRequest::Activate(id, false)).await?
         }
-        CliSubcommand::List => {
+        CliSubcommand::List { json } => {
             tx.request(FrontendRequest::Enumerate()).await?;
             while let Some(e) = rx.next().await {
                 if let FrontendEvent::Enumerate(clients) = e? {
+                    if json {
+                        print_json(&clients);
+                        break;
+                    }
                     for (handle, config, state) in clients {
                         let host = config.hostname.unwrap_or("unknown".to_owned());
                         let port = config.port;
@@ -172,6 +200,130 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 .await?
         }
         CliSubcommand::SaveConfig => tx.request(FrontendRequest::SaveConfiguration).await?,
+        CliSubcommand::Discover { json } => {
+            let peers = discovered(&mut rx, &mut tx).await?;
+            if json {
+                print_json(&peers);
+            } else if peers.is_empty() {
+                println!("no devices found");
+            } else {
+                for p in peers {
+                    let paired = if p.paired { "paired" } else { "not paired" };
+                    println!(
+                        "{} ({}) {paired}, fingerprint {}",
+                        p.name, p.hostname, p.fingerprint
+                    );
+                }
+            }
+        }
+        CliSubcommand::Pair { device, pos } => {
+            let peers = discovered(&mut rx, &mut tx).await?;
+            let peer = find_device(&peers, &device)?;
+            let fingerprint = peer.fingerprint.clone();
+            tx.request(FrontendRequest::Pair {
+                fingerprint: fingerprint.clone(),
+                pos,
+            })
+            .await?;
+            while let Some(e) = rx.next().await {
+                let FrontendEvent::PairUpdate {
+                    fingerprint: fp,
+                    name,
+                    status,
+                } = e?
+                else {
+                    continue;
+                };
+                if fp != fingerprint {
+                    continue;
+                }
+                match status {
+                    PairStatus::Waiting { code } => {
+                        println!("Confirm the pairing on {name}. It should show the code {code}.")
+                    }
+                    PairStatus::Paired => {
+                        let place = pos.relative_phrase();
+                        println!("Paired with {name}, which is now {place}.");
+                        break;
+                    }
+                    PairStatus::Declined => {
+                        return Err(CliError::Failed(format!("{name} declined the pairing")));
+                    }
+                    PairStatus::Failed(e) => {
+                        return Err(CliError::Failed(format!("pairing with {name} failed: {e}")));
+                    }
+                }
+            }
+        }
+        CliSubcommand::PairAccept { fingerprint } => {
+            tx.request(FrontendRequest::PairResponse {
+                fingerprint,
+                accept: true,
+            })
+            .await?
+        }
+        CliSubcommand::PairDecline { fingerprint } => {
+            tx.request(FrontendRequest::PairResponse {
+                fingerprint,
+                accept: false,
+            })
+            .await?
+        }
+        CliSubcommand::Watch => {
+            tx.request(FrontendRequest::Sync).await?;
+            tx.request(FrontendRequest::Discover).await?;
+            while let Some(e) = rx.next().await {
+                print_json(&e?);
+            }
+        }
     }
     Ok(())
+}
+
+async fn discovered(
+    rx: &mut (impl futures::Stream<Item = Result<FrontendEvent, IpcError>> + Unpin),
+    tx: &mut lan_mouse_ipc::AsyncFrontendRequestWriter,
+) -> Result<Vec<DiscoveredPeer>, CliError> {
+    tx.request(FrontendRequest::Discover).await?;
+    while let Some(e) = rx.next().await {
+        if let FrontendEvent::Discovered(peers) = e? {
+            return Ok(peers);
+        }
+    }
+    Ok(vec![])
+}
+
+/// Match `query` against names, host names and fingerprint prefixes.
+fn find_device<'a>(
+    peers: &'a [DiscoveredPeer],
+    query: &str,
+) -> Result<&'a DiscoveredPeer, CliError> {
+    let query = query.trim_end_matches('.');
+    let matches: Vec<_> = peers
+        .iter()
+        .filter(|p| {
+            p.name.eq_ignore_ascii_case(query)
+                || p.hostname.eq_ignore_ascii_case(query)
+                || p.hostname
+                    .strip_suffix(".local")
+                    .is_some_and(|h| h.eq_ignore_ascii_case(query))
+                || (query.len() >= 5 && p.fingerprint.starts_with(&query.to_lowercase()))
+        })
+        .collect();
+    match matches[..] {
+        [peer] => Ok(peer),
+        [] => Err(CliError::Failed(format!(
+            "no device \"{query}\" on the network, see `lan-mouse cli discover`"
+        ))),
+        _ => Err(CliError::Failed(format!(
+            "\"{query}\" matches several devices, use the fingerprint"
+        ))),
+    }
+}
+
+fn print_json(value: &impl serde::Serialize) {
+    match serde_json::to_string(value) {
+        Ok(json) => println!("{json}"),
+        Err(e) => eprintln!("could not encode as JSON: {e}"),
+    }
 }

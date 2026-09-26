@@ -330,6 +330,20 @@ Authorized devices can be persisted using the configuration file (see [Configura
 If the device still can not be entered, make sure you have UDP port `4242` (or the one selected) opened up in your firewall.
 Clipboard sync additionally uses TCP on the same port.
 
+Devices running Lan Mouse find each other on the local network (mDNS / DNS-SD, UDP port `5353`)
+and can be paired without typing addresses or fingerprints:
+
+```sh
+lan-mouse cli discover                 # devices on the network
+lan-mouse cli pair macbook left        # pair, placing "macbook" on your left
+```
+
+The other device asks for confirmation and shows the same six-digit code (in the GTK app a dialog pops up;
+from the command line, answer with `lan-mouse cli pair-accept <fingerprint>` or `pair-decline`).
+Once confirmed, both devices trust each other and are set up at opposite edges.
+`lan-mouse cli watch` prints all service events, including pairing requests, as JSON lines for scripting.
+The name other devices see defaults to the host name and can be set with `name = "..."` in the config file.
+
 The clipboard follows the cursor: when you move to another device, your clipboard's text is sent along,
 over a mutually authenticated TLS connection that only devices with authorized fingerprints can use.
 It relies on `wl-copy`/`wl-paste` (wl-clipboard) on Linux and `pbcopy`/`pbpaste` on macOS,
@@ -403,6 +417,9 @@ port = 4242
 
 # send the clipboard along when the cursor moves to another device (default: true)
 clipboard = true
+
+# name shown to other devices (default: the host name)
+name = "Work Laptop"
 
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic

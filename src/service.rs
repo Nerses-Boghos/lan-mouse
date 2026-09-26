@@ -1,10 +1,11 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
-    clipboard::Clipboard,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
+    control::{Control, ControlEvent, PairReply, PairRequest, pairing_code},
     crypto,
+    discovery::{self, Discovery},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
@@ -12,7 +13,7 @@ use crate::{
 use futures::StreamExt;
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    IpcListenerCreationError, PairStatus, Position, Status,
 };
 use log;
 use std::{
@@ -22,7 +23,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{
+    process::Command,
+    signal,
+    sync::{Notify, oneshot},
+};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -49,8 +54,16 @@ pub struct Service {
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
-    /// clipboard sync, if enabled
-    clipboard: Option<Clipboard>,
+    /// control channel for clipboard and pairing (if the port could be bound)
+    control: Option<Control>,
+    /// local network discovery (if mDNS is available)
+    discovery: Option<Discovery>,
+    /// this device's display name, as announced to others
+    name: String,
+    /// the `.local` host name other devices reach this one under
+    hostname: String,
+    /// pairing requests waiting for the user's answer, by fingerprint
+    pending_pairs: HashMap<String, PendingPair>,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -70,6 +83,12 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+}
+
+#[derive(Debug)]
+struct PendingPair {
+    request: PairRequest,
+    reply: oneshot::Sender<PairReply>,
 }
 
 #[derive(Debug)]
@@ -98,14 +117,20 @@ impl Service {
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
-        let clipboard = if config.clipboard() {
-            Clipboard::new(config.port(), &cert, authorized_keys.clone())
-                .await
-                .inspect_err(|e| log::warn!("clipboard sync disabled: {e}"))
-                .ok()
-        } else {
-            None
-        };
+        let control = Control::new(
+            config.port(),
+            &cert,
+            authorized_keys.clone(),
+            config.clipboard(),
+        )
+        .await
+        .inspect_err(|e| log::warn!("clipboard sync and pairing unavailable: {e}"))
+        .ok();
+        let name = config.name().unwrap_or_else(discovery::local_name);
+        let hostname = discovery::local_hostname();
+        let discovery = Discovery::new(&name, &hostname, config.port(), &public_key_fingerprint)
+            .inspect_err(|e| log::warn!("local network discovery unavailable: {e}"))
+            .ok();
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -124,7 +149,11 @@ impl Service {
             frontend_listener,
             resolver,
             authorized_keys,
-            clipboard,
+            control,
+            discovery,
+            name,
+            hostname,
+            pending_pairs: Default::default(),
             public_key_fingerprint,
             client_manager,
             frontend_event_pending: Default::default(),
@@ -159,6 +188,8 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                event = next_control_event(&mut self.control) => self.handle_control_event(event),
+                _ = discovery_changed(&mut self.discovery) => self.broadcast_discovered(),
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -171,6 +202,9 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        if let Some(discovery) = &self.discovery {
+            discovery.terminate();
+        }
 
         Ok(())
     }
@@ -230,6 +264,12 @@ impl Service {
                 self.update_leave_hook(handle, leave_hook)
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::Discover => self.broadcast_discovered(),
+            FrontendRequest::Pair { fingerprint, pos } => self.start_pairing(fingerprint, pos),
+            FrontendRequest::PairResponse {
+                fingerprint,
+                accept,
+            } => self.answer_pairing(fingerprint, accept),
         }
     }
 
@@ -366,10 +406,10 @@ impl Service {
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Enter);
-                if let (Some(clipboard), Some(addr)) =
-                    (&self.clipboard, self.client_manager.active_addr(handle))
+                if let (Some(control), Some(addr)) =
+                    (&self.control, self.client_manager.active_addr(handle))
                 {
-                    clipboard.send_to(addr);
+                    control.send_clipboard(addr);
                 }
             }
             ICaptureEvent::ClientLeft(handle) => {
@@ -396,6 +436,189 @@ impl Service {
             }
         };
         self.broadcast_client(handle);
+    }
+
+    fn handle_control_event(&mut self, event: ControlEvent) {
+        match event {
+            ControlEvent::PairRequest {
+                fingerprint,
+                request,
+                reply,
+            } => {
+                let code = pairing_code(&self.public_key_fingerprint, &fingerprint);
+                self.notify_frontend(FrontendEvent::PairRequest {
+                    fingerprint: fingerprint.clone(),
+                    name: request.name.clone(),
+                    code,
+                    pos: request.pos,
+                });
+                // a newer request from the same device replaces (declines) the old one
+                self.pending_pairs
+                    .insert(fingerprint, PendingPair { request, reply });
+            }
+            ControlEvent::PairFinished {
+                fingerprint,
+                pos,
+                result,
+            } => {
+                let known = self.discovery.as_ref().and_then(|d| d.get(&fingerprint));
+                let (name, status) = match result {
+                    Ok(reply) if reply.accepted => {
+                        // prefer the address the device is announced under
+                        let (hostname, port) = known
+                            .as_ref()
+                            .map(|p| (p.hostname.clone(), p.port))
+                            .unwrap_or((reply.hostname, reply.port));
+                        self.complete_pairing(&fingerprint, &reply.name, &hostname, port, pos);
+                        (reply.name, PairStatus::Paired)
+                    }
+                    Ok(_) => (display_name(known.as_ref()), PairStatus::Declined),
+                    Err(e) => {
+                        log::warn!("pairing with {fingerprint} failed: {e}");
+                        (
+                            display_name(known.as_ref()),
+                            PairStatus::Failed(e.to_string()),
+                        )
+                    }
+                };
+                log::info!("pairing with {name}: {status:?}");
+                self.notify_frontend(FrontendEvent::PairUpdate {
+                    fingerprint,
+                    name,
+                    status,
+                });
+            }
+        }
+    }
+
+    fn broadcast_discovered(&mut self) {
+        let Some(discovery) = &self.discovery else {
+            self.notify_frontend(FrontendEvent::Discovered(vec![]));
+            return;
+        };
+        let keys = self.authorized_keys.read().expect("lock").clone();
+        let peers = discovery.peers(|fp| keys.contains_key(fp));
+        self.notify_frontend(FrontendEvent::Discovered(peers));
+    }
+
+    /// Ask the discovered device `fingerprint` to pair; it will sit at `pos`.
+    fn start_pairing(&mut self, fingerprint: String, pos: Position) {
+        let peer = self.discovery.as_ref().and_then(|d| d.get(&fingerprint));
+        let (Some(control), Some(peer)) = (&self.control, peer) else {
+            let status = PairStatus::Failed("device not found on the network".to_owned());
+            self.notify_frontend(FrontendEvent::PairUpdate {
+                name: fingerprint.clone(),
+                fingerprint,
+                status,
+            });
+            return;
+        };
+        let Some(&ip) = peer.ips.first() else {
+            let status = PairStatus::Failed("device has no reachable address".to_owned());
+            self.notify_frontend(FrontendEvent::PairUpdate {
+                fingerprint,
+                name: peer.name,
+                status,
+            });
+            return;
+        };
+        let request = PairRequest {
+            name: self.name.clone(),
+            hostname: self.hostname.clone(),
+            port: self.port,
+            pos: pos.opposite(),
+        };
+        log::info!("asking {} to pair", peer.name);
+        control.pair(
+            SocketAddr::new(ip, peer.port),
+            fingerprint.clone(),
+            pos,
+            request,
+        );
+        let code = pairing_code(&self.public_key_fingerprint, &fingerprint);
+        self.notify_frontend(FrontendEvent::PairUpdate {
+            fingerprint,
+            name: peer.name,
+            status: PairStatus::Waiting { code },
+        });
+    }
+
+    fn answer_pairing(&mut self, fingerprint: String, accept: bool) {
+        let Some(PendingPair { request, reply }) = self.pending_pairs.remove(&fingerprint) else {
+            log::warn!("no pending pairing request from {fingerprint}");
+            return;
+        };
+        let answer = PairReply {
+            accepted: accept,
+            name: self.name.clone(),
+            hostname: self.hostname.clone(),
+            port: self.port,
+        };
+        if reply.send(answer).is_err() {
+            let status = PairStatus::Failed("the request expired".to_owned());
+            self.notify_frontend(FrontendEvent::PairUpdate {
+                fingerprint,
+                name: request.name,
+                status,
+            });
+            return;
+        }
+        let status = if accept {
+            self.complete_pairing(
+                &fingerprint,
+                &request.name,
+                &request.hostname,
+                request.port,
+                request.pos,
+            );
+            PairStatus::Paired
+        } else {
+            PairStatus::Declined
+        };
+        self.notify_frontend(FrontendEvent::PairUpdate {
+            fingerprint,
+            name: request.name,
+            status,
+        });
+    }
+
+    /// Trust the paired device and set up a client for it at `pos`,
+    /// reusing an existing client with the same address.
+    fn complete_pairing(
+        &mut self,
+        fingerprint: &str,
+        name: &str,
+        hostname: &str,
+        port: u16,
+        pos: Position,
+    ) {
+        self.add_authorized_key(name.to_owned(), fingerprint.to_owned());
+        let existing = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .find(|(_, c, _)| {
+                c.port == port
+                    && c.hostname
+                        .as_deref()
+                        .is_some_and(|h| same_host(h, hostname))
+            })
+            .map(|(handle, _, _)| handle);
+        let handle = match existing {
+            Some(handle) => handle,
+            None => {
+                let handle = self.client_manager.add_client();
+                let (c, s) = self.client_manager.get_state(handle).expect("new client");
+                self.notify_frontend(FrontendEvent::Created(handle, c, s));
+                self.update_hostname(handle, Some(hostname.to_owned()));
+                self.update_port(handle, port);
+                handle
+            }
+        };
+        self.update_pos(handle, pos);
+        self.activate_client(handle);
+        self.save_config();
+        log::info!("paired with {name} ({hostname}), placed {pos}");
     }
 
     fn resolve(&self, handle: ClientHandle) {
@@ -654,4 +877,29 @@ impl std::fmt::Display for HookKind {
             HookKind::Leave => f.write_str("leave"),
         }
     }
+}
+
+async fn next_control_event(control: &mut Option<Control>) -> ControlEvent {
+    match control {
+        Some(control) => control.event().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn discovery_changed(discovery: &mut Option<Discovery>) {
+    match discovery {
+        Some(discovery) => discovery.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn display_name(peer: Option<&lan_mouse_ipc::DiscoveredPeer>) -> String {
+    peer.map(|p| p.name.clone())
+        .unwrap_or_else(|| "device".to_owned())
+}
+
+/// Host names are case-insensitive, and `.local` names may carry a trailing dot.
+fn same_host(a: &str, b: &str) -> bool {
+    a.trim_end_matches('.')
+        .eq_ignore_ascii_case(b.trim_end_matches('.'))
 }
