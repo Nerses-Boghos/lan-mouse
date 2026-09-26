@@ -1,6 +1,7 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard::Clipboard,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
@@ -48,6 +49,8 @@ pub struct Service {
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+    /// clipboard sync, if enabled
+    clipboard: Option<Clipboard>,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -95,6 +98,14 @@ impl Service {
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let clipboard = if config.clipboard() {
+            Clipboard::new(config.port(), &cert, authorized_keys.clone())
+                .await
+                .inspect_err(|e| log::warn!("clipboard sync disabled: {e}"))
+                .ok()
+        } else {
+            None
+        };
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -113,6 +124,7 @@ impl Service {
             frontend_listener,
             resolver,
             authorized_keys,
+            clipboard,
             public_key_fingerprint,
             client_manager,
             frontend_event_pending: Default::default(),
@@ -354,6 +366,11 @@ impl Service {
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Enter);
+                if let (Some(clipboard), Some(addr)) =
+                    (&self.clipboard, self.client_manager.active_addr(handle))
+                {
+                    clipboard.send_to(addr);
+                }
             }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");

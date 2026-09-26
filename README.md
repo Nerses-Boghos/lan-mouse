@@ -328,6 +328,12 @@ It is of the form "aa:bb:cc:..."
 Authorized devices can be persisted using the configuration file (see [Configuration](#configuration)).
 
 If the device still can not be entered, make sure you have UDP port `4242` (or the one selected) opened up in your firewall.
+Clipboard sync additionally uses TCP on the same port.
+
+The clipboard follows the cursor: when you move to another device, your clipboard's text is sent along,
+over a mutually authenticated TLS connection that only devices with authorized fingerprints can use.
+It relies on `wl-copy`/`wl-paste` (wl-clipboard) on Linux and `pbcopy`/`pbpaste` on macOS,
+and can be turned off with `clipboard = false` in the config file.
 </details>
 
 <details>
@@ -394,6 +400,9 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 
 # optional port (defaults to 4242)
 port = 4242
+
+# send the clipboard along when the cursor moves to another device (default: true)
+clipboard = true
 
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic

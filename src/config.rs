@@ -69,6 +69,8 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    /// send the clipboard along when the cursor moves to another device
+    clipboard: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -493,6 +495,14 @@ impl Config {
     }
 
     /// release bind for returning control to the host
+    /// whether the clipboard follows the cursor to other devices (default: on)
+    pub fn clipboard(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard)
+            .unwrap_or(true)
+    }
+
     pub fn release_bind(&self) -> Vec<scancode::Linux> {
         self.config_toml
             .as_ref()
