@@ -41,6 +41,9 @@ enum LanMouseError {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    log_to_file_when_launched_as_app();
+
     // init logging
     let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
     env_logger::init_from_env(env);
@@ -48,6 +51,36 @@ fn main() {
     if let Err(e) = run() {
         log::error!("{e}");
         process::exit(1);
+    }
+}
+
+/// An app started from Finder or at login has no terminal, so its log and any
+/// crash message would be lost. Send stderr (where both go, including a
+/// panic's message right before the process aborts) to
+/// `~/Library/Logs/Lan Mouse/lan-mouse.log` instead. The service process
+/// started by the app inherits it.
+#[cfg(target_os = "macos")]
+fn log_to_file_when_launched_as_app() {
+    use std::{fs, io::IsTerminal, os::fd::AsRawFd};
+
+    if io::stderr().is_terminal() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::Path::new(&home).join("Library/Logs/Lan Mouse");
+    let path = dir.join("lan-mouse.log");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    // keep one previous log, so a restart after a crash doesn't bury it
+    if fs::metadata(&path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
+        let _ = fs::rename(&path, dir.join("lan-mouse.old.log"));
+    }
+    if let Ok(file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        // SAFETY: both descriptors are valid; dup2 atomically replaces stderr.
+        unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) };
     }
 }
 

@@ -6,6 +6,7 @@ use std::{
 };
 
 use slab::Slab;
+use tokio::sync::Notify;
 
 use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
 
@@ -14,6 +15,11 @@ use crate::config::ConfigClient;
 #[derive(Clone, Default)]
 pub struct ClientManager {
     clients: Rc<RefCell<Slab<(ClientConfig, ClientState)>>>,
+    /// clients whose connection state changed outside the service's own
+    /// requests (connects, disconnects, peer liveness), see
+    /// [`ClientManager::connection_changed`]
+    connection_changes: Rc<RefCell<HashSet<ClientHandle>>>,
+    connection_changed: Rc<Notify>,
 }
 
 impl ClientManager {
@@ -287,20 +293,55 @@ impl ClientManager {
     }
 
     pub(crate) fn set_active_addr(&self, handle: ClientHandle, addr: Option<SocketAddr>) {
-        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            s.active_addr = addr;
-        }
+        let changed = self.update_state(handle, |s| {
+            std::mem::replace(&mut s.active_addr, addr) != addr
+        });
+        self.mark_connection_changed(handle, changed);
     }
 
     pub(crate) fn set_alive(&self, handle: ClientHandle, alive: bool) {
-        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            s.alive = alive;
-        }
+        let changed =
+            self.update_state(handle, |s| std::mem::replace(&mut s.alive, alive) != alive);
+        self.mark_connection_changed(handle, changed);
     }
 
     pub(crate) fn set_peer_commit(&self, handle: ClientHandle, commit: Option<[u8; 8]>) {
-        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            s.peer_commit = commit;
+        let changed = self.update_state(handle, |s| {
+            std::mem::replace(&mut s.peer_commit, commit) != commit
+        });
+        self.mark_connection_changed(handle, changed);
+    }
+
+    /// Applies `update` to the client's state; returns what it returns, or
+    /// false if there is no such client.
+    fn update_state(
+        &self,
+        handle: ClientHandle,
+        update: impl FnOnce(&mut ClientState) -> bool,
+    ) -> bool {
+        self.clients
+            .borrow_mut()
+            .get_mut(handle as usize)
+            .is_some_and(|(_, s)| update(s))
+    }
+
+    fn mark_connection_changed(&self, handle: ClientHandle, changed: bool) {
+        if changed {
+            self.connection_changes.borrow_mut().insert(handle);
+            self.connection_changed.notify_one();
+        }
+    }
+
+    /// Waits for connection state changes and returns the affected clients,
+    /// so frontends can be told (connections are managed outside the service
+    /// loop and would otherwise go unreported).
+    pub(crate) async fn connection_changed(&self) -> Vec<ClientHandle> {
+        loop {
+            let changed: Vec<_> = self.connection_changes.borrow_mut().drain().collect();
+            if !changed.is_empty() {
+                return changed;
+            }
+            self.connection_changed.notified().await;
         }
     }
 

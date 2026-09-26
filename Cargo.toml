@@ -20,7 +20,8 @@ repository = "https://github.com/feschber/lan-mouse"
 [profile.release]
 codegen-units = 1
 lto = "fat"
-strip = true
+# keep function names, so crash reports show where a crash happened
+strip = "debuginfo"
 panic = "abort"
 
 [build-dependencies]

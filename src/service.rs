@@ -188,6 +188,11 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                handles = self.client_manager.connection_changed() => {
+                    for handle in handles {
+                        self.broadcast_client(handle);
+                    }
+                }
                 event = next_control_event(&mut self.control) => self.handle_control_event(event),
                 _ = discovery_changed(&mut self.discovery) => self.broadcast_discovered(),
                 _ = self.config.changed() => self.handle_config_change(),
