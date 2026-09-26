@@ -85,6 +85,8 @@ struct TomlClient {
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
     leave_hook: Option<String>,
+    /// where the client's screen starts along the shared edge, in pixels
+    offset: Option<i32>,
 }
 
 impl ConfigToml {
@@ -281,6 +283,7 @@ pub struct ConfigClient {
     pub active: bool,
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
+    pub offset: Option<i32>,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -300,6 +303,7 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             leave_hook,
+            offset: toml.offset,
         }
     }
 }
@@ -329,6 +333,7 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             leave_hook,
+            offset: client.offset,
         }
     }
 }

@@ -153,6 +153,11 @@ pub struct ClientConfig {
     pub cmd: Option<String>,
     /// leave hook
     pub leave_cmd: Option<String>,
+    /// Where the client's screen starts along the shared edge, in this
+    /// device's logical pixels (e.g. its top relative to this screen's top
+    /// for a client on the left). `None` maps the edges proportionally.
+    #[serde(default)]
+    pub offset: Option<i32>,
 }
 
 impl Default for ClientConfig {
@@ -164,6 +169,7 @@ impl Default for ClientConfig {
             pos: Default::default(),
             cmd: None,
             leave_cmd: None,
+            offset: None,
         }
     }
 }
@@ -196,6 +202,9 @@ pub struct ClientState {
     /// that predates the Hello event. The frontend uses this to
     /// soft-warn on version mismatch.
     pub peer_commit: Option<[u8; 8]>,
+    /// the client's desktop size in logical pixels, as it reported it
+    #[serde(default)]
+    pub peer_size: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +328,9 @@ pub enum FrontendRequest {
     UpdateLeaveHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+    /// set where the client's screen starts along the shared edge, see
+    /// [`ClientConfig::offset`]
+    UpdateOffset(ClientHandle, Option<i32>),
     /// request the list of discovered devices
     Discover,
     /// pair with a discovered device that will sit at `pos` relative to this one

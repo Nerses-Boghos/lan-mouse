@@ -365,7 +365,15 @@ impl CaptureTask {
         }
 
         if let CaptureEvent::Begin { along } = event {
-            self.entry_along = along;
+            self.entry_along = if self.get_type(handle) == CaptureType::Default {
+                match self.map_crossing(handle, along) {
+                    Some(along) => along,
+                    // outside the other screen: stay on this one
+                    None => return capture.release().await,
+                }
+            } else {
+                along
+            };
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
                 .expect("channel closed");
@@ -422,6 +430,39 @@ impl CaptureTask {
             self.release_capture(capture).await?;
         }
         Ok(())
+    }
+
+    /// Where a crossing at `along` (a fraction of this desktop's edge) lands
+    /// on the client's screen, as a fraction of its edge. `Some(None)` leaves
+    /// the landing spot unknown; `None` means the crossing misses the other
+    /// screen and must not happen.
+    ///
+    /// Without an arranged offset the edges map proportionally, top to top
+    /// and bottom to bottom. With one, positions map pixel for pixel, as the
+    /// screens are arranged.
+    fn map_crossing(&self, handle: CaptureHandle, along: Option<u16>) -> Option<Option<u16>> {
+        let arrangement = self.conn.client_manager().arrangement(handle);
+        let (Some(along), Some(arrangement)) = (along, arrangement) else {
+            return Some(along);
+        };
+        let (Some(offset), Some((peer_width, peer_height))) =
+            (arrangement.offset, arrangement.peer_size)
+        else {
+            return Some(Some(along));
+        };
+        let pos = arrangement.pos;
+        let Some(local) = input_capture::desktop_bounds() else {
+            return Some(Some(along));
+        };
+        let (local_len, peer_len) = match pos {
+            lan_mouse_ipc::Position::Left | lan_mouse_ipc::Position::Right => {
+                (local.height, peer_height)
+            }
+            lan_mouse_ipc::Position::Top | lan_mouse_ipc::Position::Bottom => {
+                (local.width, peer_width)
+            }
+        };
+        arranged_crossing(along, local_len, offset, peer_len)
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
@@ -525,5 +566,54 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+/// Pixel-exact mapping of a crossing at `along` (fraction of a local edge of
+/// `local_len` pixels) onto a screen whose edge starts `offset` pixels along
+/// ours and is `peer_len` long. `None` if the crossing misses that screen.
+fn arranged_crossing(
+    along: u16,
+    local_len: u32,
+    offset: i32,
+    peer_len: u32,
+) -> Option<Option<u16>> {
+    let local_px = along as f64 / u16::MAX as f64 * local_len as f64;
+    let peer_px = local_px - offset as f64;
+    if peer_px < 0.0 || peer_px >= peer_len as f64 {
+        return None;
+    }
+    Some(Some(input_capture::edge_fraction(
+        peer_px,
+        0.0,
+        peer_len as f64,
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::arranged_crossing;
+
+    fn fraction(f: f64) -> u16 {
+        (f * u16::MAX as f64).round() as u16
+    }
+
+    #[test]
+    fn arranged_crossings_line_up_pixel_for_pixel() {
+        // a 900px screen whose top sits 100px below the top of our 768px edge
+        let landing = arranged_crossing(fraction(0.5), 768, 100, 900).expect("hits");
+        // 384px down our edge is 284px down theirs
+        let expected = fraction(284.0 / 900.0);
+        assert!(landing.unwrap().abs_diff(expected) <= 1);
+    }
+
+    #[test]
+    fn crossings_outside_the_other_screen_are_refused() {
+        // their screen starts 100px down: the top 100px of our edge lead nowhere
+        assert_eq!(arranged_crossing(fraction(0.05), 768, 100, 900), None);
+        // a small screen ending 300px down: below that too
+        assert_eq!(arranged_crossing(fraction(0.9), 768, 0, 300), None);
+        // a screen above ours (negative offset) overlapping its top part
+        assert!(arranged_crossing(fraction(0.1), 768, -500, 900).is_some());
     }
 }

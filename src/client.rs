@@ -12,6 +12,15 @@ use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
 
 use crate::config::ConfigClient;
 
+/// See [`ClientManager::arrangement`].
+pub(crate) struct Arrangement {
+    pub(crate) pos: Position,
+    /// see [`lan_mouse_ipc::ClientConfig::offset`]
+    pub(crate) offset: Option<i32>,
+    /// the client's desktop size, once it reported it
+    pub(crate) peer_size: Option<(u32, u32)>,
+}
+
 #[derive(Clone, Default)]
 pub struct ClientManager {
     clients: Rc<RefCell<Slab<(ClientConfig, ClientState)>>>,
@@ -40,6 +49,7 @@ impl ClientManager {
             pos: config_client.pos,
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
+            offset: config_client.offset,
         };
         let state = ClientState {
             active: config_client.active,
@@ -234,6 +244,32 @@ impl ClientManager {
             }
             _ => false,
         }
+    }
+
+    /// set where the client's screen starts along the shared edge
+    pub(crate) fn set_offset(&self, handle: ClientHandle, offset: Option<i32>) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.offset = offset;
+        }
+    }
+
+    /// Where a client's screen is: what's needed to line up a crossing.
+    pub(crate) fn arrangement(&self, handle: ClientHandle) -> Option<Arrangement> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, s)| Arrangement {
+                pos: c.pos,
+                offset: c.offset,
+                peer_size: s.peer_size,
+            })
+    }
+
+    pub(crate) fn set_peer_size(&self, handle: ClientHandle, size: Option<(u32, u32)>) {
+        let changed = self.update_state(handle, |s| {
+            std::mem::replace(&mut s.peer_size, size) != size
+        });
+        self.mark_connection_changed(handle, changed);
     }
 
     /// update the enter hook command of the client

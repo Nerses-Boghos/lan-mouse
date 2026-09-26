@@ -344,6 +344,15 @@ Once confirmed, both devices trust each other and are set up at opposite edges.
 `lan-mouse cli watch` prints all service events, including pairing requests, as JSON lines for scripting.
 The name other devices see defaults to the host name and can be set with `name = "..."` in the config file.
 
+Screens of different sizes can be lined up exactly. Connected devices exchange their desktop size;
+set where a device's screen starts along the shared edge, in pixels, and the cursor then crosses at the
+matching spot and stays on this screen where the two don't overlap (like arranging displays in macOS):
+
+```sh
+lan-mouse cli set-offset 0 -120   # device 0's top edge is 120px above ours
+lan-mouse cli set-offset 0        # back to proportional (top meets top, bottom meets bottom)
+```
+
 The clipboard follows the cursor: when you move to another device, your clipboard's text is sent along,
 over a mutually authenticated TLS connection that only devices with authorized fingerprints can use.
 It relies on `wl-copy`/`wl-paste` (wl-clipboard) on Linux and `pbcopy`/`pbpaste` on macOS,

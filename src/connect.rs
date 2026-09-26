@@ -103,6 +103,10 @@ pub(crate) struct LanMouseConnection {
 }
 
 impl LanMouseConnection {
+    pub(crate) fn client_manager(&self) -> &ClientManager {
+        &self.client_manager
+    }
+
     pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
@@ -280,6 +284,9 @@ async fn receive_loop(
                     }
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
+                    }
+                    ProtoEvent::DesktopSize { width, height } => {
+                        client_manager.set_peer_size(handle, Some((width, height)));
                     }
                     event => tx.send((handle, event)).expect("channel closed"),
                 }

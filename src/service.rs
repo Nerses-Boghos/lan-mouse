@@ -265,6 +265,11 @@ impl Service {
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
                 self.update_enter_hook(handle, enter_hook)
             }
+            FrontendRequest::UpdateOffset(handle, offset) => {
+                self.client_manager.set_offset(handle, offset);
+                self.broadcast_client(handle);
+                self.save_config();
+            }
             FrontendRequest::UpdateLeaveHook(handle, leave_hook) => {
                 self.update_leave_hook(handle, leave_hook)
             }
@@ -290,6 +295,7 @@ impl Service {
                 active: s.active,
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
+                offset: c.offset,
             })
             .collect();
         self.config.set_clients(clients);

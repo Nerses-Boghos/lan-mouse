@@ -193,6 +193,11 @@ impl ListenTask {
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
+                                // let the peer line up its screen edge with this desktop
+                                if let Some(desktop) = input_capture::desktop_bounds() {
+                                    let size = ProtoEvent::DesktopSize { width: desktop.width, height: desktop.height };
+                                    self.listener.reply(addr, size).await;
+                                }
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             _ => {}

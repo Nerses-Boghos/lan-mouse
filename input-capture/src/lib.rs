@@ -15,6 +15,9 @@ pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
 pub mod error;
 
+mod desktop;
+pub use desktop::{DesktopBounds, desktop_bounds};
+
 #[cfg(libei)]
 mod libei;
 

@@ -86,6 +86,14 @@ enum CliSubcommand {
     SetPosition { id: ClientHandle, pos: Position },
     /// set ips
     SetIps { id: ClientHandle, ips: Vec<IpAddr> },
+    /// line up a client's screen: where its edge starts along ours, in pixels
+    /// (e.g. its top relative to our top for a client on the left); leave
+    /// out to map the edges proportionally
+    SetOffset {
+        id: ClientHandle,
+        #[arg(allow_hyphen_values = true)]
+        offset: Option<i32>,
+    },
     /// re-enable capture
     EnableCapture,
     /// re-enable emulation
@@ -182,6 +190,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::SetIps { id, ips } => {
             tx.request(FrontendRequest::UpdateFixIps(id, ips)).await?
+        }
+        CliSubcommand::SetOffset { id, offset } => {
+            tx.request(FrontendRequest::UpdateOffset(id, offset))
+                .await?
         }
         CliSubcommand::EnableCapture => tx.request(FrontendRequest::EnableCapture).await?,
         CliSubcommand::EnableEmulation => tx.request(FrontendRequest::EnableEmulation).await?,

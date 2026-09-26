@@ -77,6 +77,9 @@ pub enum ProtoEvent {
     /// to [`u16::MAX`] (bottom / right end). Peers that don't know this event
     /// skip it and keep their cursor where it was.
     CursorPosition { pos: Position, along: u16 },
+    /// The sender's desktop size in logical pixels, sent in reply to
+    /// [`ProtoEvent::Hello`] so the connecting side can line up screens.
+    DesktopSize { width: u32, height: u32 },
 }
 
 impl Display for ProtoEvent {
@@ -101,6 +104,7 @@ impl Display for ProtoEvent {
             ProtoEvent::CursorPosition { pos, along } => {
                 write!(f, "CursorPosition({pos}, {along})")
             }
+            ProtoEvent::DesktopSize { width, height } => write!(f, "DesktopSize({width}x{height})"),
         }
     }
 }
@@ -121,6 +125,7 @@ pub enum EventType {
     Ack,
     Hello,
     CursorPosition,
+    DesktopSize,
 }
 
 impl ProtoEvent {
@@ -145,6 +150,7 @@ impl ProtoEvent {
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
             ProtoEvent::CursorPosition { .. } => EventType::CursorPosition,
+            ProtoEvent::DesktopSize { .. } => EventType::DesktopSize,
         }
     }
 }
@@ -209,6 +215,10 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             EventType::CursorPosition => Ok(Self::CursorPosition {
                 pos: decode_u8(&mut buf)?.try_into()?,
                 along: decode_u16(&mut buf)?,
+            }),
+            EventType::DesktopSize => Ok(Self::DesktopSize {
+                width: decode_u32(&mut buf)?,
+                height: decode_u32(&mut buf)?,
             }),
         }
     }
@@ -283,6 +293,10 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     encode_u8(buf, len, pos as u8);
                     encode_u16(buf, len, along);
                 }
+                ProtoEvent::DesktopSize { width, height } => {
+                    encode_u32(buf, len, width);
+                    encode_u32(buf, len, height);
+                }
             }
         }
         (buf, len)
@@ -331,6 +345,22 @@ encode_impl!(f64);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_size_round_trip() {
+        let (buf, _) = ProtoEvent::DesktopSize {
+            width: 1440,
+            height: 900,
+        }
+        .into();
+        assert!(matches!(
+            ProtoEvent::try_from(buf),
+            Ok(ProtoEvent::DesktopSize {
+                width: 1440,
+                height: 900
+            })
+        ));
+    }
 
     #[test]
     fn cursor_position_round_trip() {
