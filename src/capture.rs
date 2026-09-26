@@ -85,6 +85,7 @@ impl Capture {
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
             conn,
+            last_send_failure: None,
             entry_along: None,
             event_tx,
             request_rx,
@@ -164,12 +165,17 @@ macro_rules! debounce {
     };
 }
 
+/// How long to ignore new crossings after sending to a client failed.
+const RETRY_COOLDOWN: Duration = Duration::from_millis(500);
+
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: LanMouseConnection,
+    /// when sending to a client last failed, see [`RETRY_COOLDOWN`]
+    last_send_failure: Option<Instant>,
     /// where the cursor crossed into the active client, re-sent with every `Enter`
     entry_along: Option<u16>,
     event_tx: Sender<ICaptureEvent>,
@@ -347,6 +353,17 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
+        // While a client is unreachable, the cursor stays pressed against the
+        // edge and re-triggers capture continuously. Don't retry (and fire the
+        // enter hook) on every one of those until the cooldown has passed.
+        if matches!(event, CaptureEvent::Begin { .. })
+            && self
+                .last_send_failure
+                .is_some_and(|t| t.elapsed() < RETRY_COOLDOWN)
+        {
+            return capture.release().await;
+        }
+
         if let CaptureEvent::Begin { along } = event {
             self.entry_along = along;
             self.event_tx
@@ -395,6 +412,7 @@ impl CaptureTask {
         }
 
         if let Err(e) = result {
+            self.last_send_failure = Some(Instant::now());
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
             // Funnel through release_capture so the leave_hook

@@ -129,6 +129,11 @@ impl Emulation {
     }
 }
 
+/// How long a peer may stay silent before its keys are released and it is
+/// considered gone. Peers ping every 500ms, but on Wi-Fi single round trips
+/// regularly spike past a second, so a tighter limit drops live connections.
+const PEER_TIMEOUT: Duration = Duration::from_secs(3);
+
 struct ListenTask {
     listener: LanMouseListener,
     emulation_proxy: EmulationProxy,
@@ -212,7 +217,7 @@ impl ListenTask {
                 },
                 _ = interval.tick() => {
                     last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > Duration::from_secs(1) {
+                        if instant.elapsed() > PEER_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
