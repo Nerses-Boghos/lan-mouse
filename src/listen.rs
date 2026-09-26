@@ -214,6 +214,21 @@ impl LanMouseListener {
         }
     }
 
+    /// Close every connection from the device with `fingerprint` and return
+    /// their addresses. Authorization is only checked during the handshake,
+    /// so revoking a device must also end the connections it already has.
+    pub(crate) async fn disconnect(&self, fingerprint: &str) -> Vec<SocketAddr> {
+        let conns = self.conns.lock().await.clone();
+        let mut closed = vec![];
+        for (addr, conn) in conns {
+            if self.get_certificate_fingerprint(addr).await.as_deref() == Some(fingerprint) {
+                let _ = conn.close().await;
+                closed.push(addr);
+            }
+        }
+        closed
+    }
+
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
         if let Some(conn) = self
             .conns

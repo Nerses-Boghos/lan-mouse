@@ -69,6 +69,8 @@ pub(crate) enum EmulationEvent {
 enum EmulationRequest {
     Reenable,
     Release(SocketAddr),
+    /// drop the connections of a device that is no longer authorized
+    Disconnect(String),
     ChangePort(u16),
     Terminate,
 }
@@ -98,6 +100,13 @@ impl Emulation {
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
         self.request_tx
             .send(EmulationRequest::Release(addr))
+            .expect("channel closed");
+    }
+
+    /// End all connections from the device with `fingerprint`.
+    pub(crate) fn disconnect(&self, fingerprint: String) {
+        self.request_tx
+            .send(EmulationRequest::Disconnect(fingerprint))
             .expect("channel closed");
     }
 
@@ -208,6 +217,14 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Disconnect(fingerprint) => {
+                        for addr in self.listener.disconnect(&fingerprint).await {
+                            log::info!("disconnected {addr}: no longer authorized");
+                            self.emulation_proxy.remove(addr);
+                            last_response.remove(&addr);
+                            self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                        }
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;

@@ -711,12 +711,16 @@ impl Service {
         self.authorized_keys.write().expect("lock").insert(fp, desc);
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        // discovered devices carry a `paired` flag derived from these keys
+        self.broadcast_discovered();
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
         self.authorized_keys.write().expect("lock").remove(&fp);
+        self.emulation.disconnect(fp.clone());
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.broadcast_discovered();
     }
 
     fn enumerate(&mut self) {
