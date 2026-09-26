@@ -434,14 +434,19 @@ impl EmulationTask {
     }
 }
 
+/// How far inside the entry edge the cursor is placed, as a fraction of the
+/// desktop. Placing it on the edge itself lets the slightest movement back
+/// trigger the barrier again and bounce the cursor between devices.
+const ENTRY_INSET: f64 = 0.01;
+
 /// Desktop fractions `(x, y)` of the point `along` the entry edge `pos`.
 fn entry_point(pos: Position, along: u16) -> (f64, f64) {
     let t = along as f64 / u16::MAX as f64;
     match pos {
-        Position::Left => (0.0, t),
-        Position::Right => (1.0, t),
-        Position::Top => (t, 0.0),
-        Position::Bottom => (t, 1.0),
+        Position::Left => (ENTRY_INSET, t),
+        Position::Right => (1.0 - ENTRY_INSET, t),
+        Position::Top => (t, ENTRY_INSET),
+        Position::Bottom => (t, 1.0 - ENTRY_INSET),
     }
 }
 
