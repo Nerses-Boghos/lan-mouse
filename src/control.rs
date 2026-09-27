@@ -60,6 +60,13 @@ pub(crate) const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
 const KIND_CLIPBOARD: u8 = 1;
 const KIND_PAIR_REQUEST: u8 = 2;
 const KIND_PAIR_REPLY: u8 = 3;
+const KIND_PAIR_COMMIT: u8 = 4;
+const KIND_PAIR_NONCE: u8 = 5;
+const KIND_PAIR_REVEAL: u8 = 6;
+
+/// Random contribution of each side to the pairing code.
+const NONCE_LEN: usize = 32;
+type Nonce = [u8; NONCE_LEN];
 
 #[derive(Debug, Error)]
 pub(crate) enum ControlError {
@@ -77,6 +84,8 @@ pub(crate) enum ControlError {
     TooLarge(usize),
     #[error("unexpected message kind {0}")]
     UnexpectedKind(u8),
+    #[error("the other device broke its pairing commitment (someone may be interfering)")]
+    CommitMismatch,
     #[error("timed out")]
     Timeout,
 }
@@ -102,15 +111,21 @@ pub(crate) struct PairReply {
     pub(crate) port: u16,
 }
 
-pub(crate) enum ControlEvent {
+pub(crate) enum PairingEvent {
     /// A device asks to pair. Answer through `reply`; dropping it declines.
-    PairRequest {
+    Request {
         fingerprint: String,
         request: PairRequest,
+        /// shown to the user, who compares it with the other device's
+        code: String,
         reply: oneshot::Sender<PairReply>,
     },
+    /// The code of a pairing started with [`Control::pair`], known once
+    /// both sides exchanged their contributions; the other device shows the
+    /// same code while asking its user.
+    Code { fingerprint: String, code: String },
     /// A pairing started with [`Control::pair`] completed.
-    PairFinished {
+    Finished {
         fingerprint: String,
         /// where the other device sits relative to this one
         pos: Position,
@@ -123,6 +138,8 @@ type AuthorizedKeys = Arc<RwLock<HashMap<String, String>>>;
 type PeerClipboards = Rc<RefCell<HashMap<std::net::IpAddr, ([u8; 32], Instant)>>>;
 
 pub(crate) struct Control {
+    /// this device's certificate fingerprint
+    own_fingerprint: String,
     /// the TCP port listened on (only read by tests, which bind port 0)
     #[cfg_attr(not(test), allow(dead_code))]
     port: u16,
@@ -134,8 +151,8 @@ pub(crate) struct Control {
     clipboard_enabled: bool,
     /// hash of the clipboard each peer (by ip) is known to have
     peer_clipboard: PeerClipboards,
-    event_tx: Sender<ControlEvent>,
-    event_rx: Receiver<ControlEvent>,
+    event_tx: Sender<PairingEvent>,
+    event_rx: Receiver<PairingEvent>,
 }
 
 impl Control {
@@ -151,7 +168,9 @@ impl Control {
         let port = listener.local_addr()?.port();
         let (event_tx, event_rx) = channel();
         let peer_clipboard = Rc::new(RefCell::new(HashMap::new()));
+        let own_fingerprint = crypto::certificate_fingerprint(cert);
         let handler = Handler {
+            own_fingerprint: own_fingerprint.clone(),
             authorized_keys: authorized_keys.clone(),
             clipboard_enabled,
             peer_clipboard: peer_clipboard.clone(),
@@ -161,6 +180,7 @@ impl Control {
         log::info!("control channel listening on tcp port {port}");
 
         Ok(Self {
+            own_fingerprint,
             port,
             acceptor,
             handler,
@@ -196,7 +216,7 @@ impl Control {
         self.port
     }
 
-    pub(crate) async fn event(&mut self) -> ControlEvent {
+    pub(crate) async fn event(&mut self) -> PairingEvent {
         self.event_rx.recv().await.expect("channel closed")
     }
 
@@ -249,7 +269,7 @@ impl Control {
 
     /// Ask the device at `addr`, whose certificate must match `fingerprint`,
     /// to pair; it will sit at `pos` relative to this one. The outcome arrives
-    /// as [`ControlEvent::PairFinished`].
+    /// as [`PairingEvent::Finished`].
     pub(crate) fn pair(
         &self,
         addr: SocketAddr,
@@ -259,6 +279,7 @@ impl Control {
     ) {
         let connector = self.connector.clone();
         let event_tx = self.event_tx.clone();
+        let own_fingerprint = self.own_fingerprint.clone();
         spawn_local(async move {
             let result = timeout(PAIR_TIMEOUT + TIMEOUT, async {
                 let (mut tls, presented) = connect(&connector, addr).await?;
@@ -268,11 +289,20 @@ impl Control {
                     return Err(ControlError::WrongPeer(presented));
                 }
                 write_frame(&mut tls, KIND_PAIR_REQUEST, &serde_json::to_vec(&request)?).await?;
+                let code = timeout(
+                    TIMEOUT,
+                    requester_exchange(&mut tls, &own_fingerprint, &fingerprint),
+                )
+                .await?;
+                let _ = event_tx.send(PairingEvent::Code {
+                    fingerprint: fingerprint.clone(),
+                    code,
+                });
                 let payload = read_frame(&mut tls, KIND_PAIR_REPLY).await?;
                 Ok(serde_json::from_slice::<PairReply>(&payload)?)
             })
             .await;
-            let _ = event_tx.send(ControlEvent::PairFinished {
+            let _ = event_tx.send(PairingEvent::Finished {
                 fingerprint,
                 pos,
                 result,
@@ -284,10 +314,11 @@ impl Control {
 /// Handles incoming connections.
 #[derive(Clone)]
 struct Handler {
+    own_fingerprint: String,
     authorized_keys: AuthorizedKeys,
     clipboard_enabled: bool,
     peer_clipboard: PeerClipboards,
-    event_tx: Sender<ControlEvent>,
+    event_tx: Sender<PairingEvent>,
 }
 
 impl Handler {
@@ -328,11 +359,17 @@ impl Handler {
             }
             KIND_PAIR_REQUEST => {
                 let request: PairRequest = serde_json::from_slice(&payload)?;
+                let code = timeout(
+                    TIMEOUT,
+                    responder_exchange(tls, &fingerprint, &self.own_fingerprint),
+                )
+                .await?;
                 log::info!("{} ({addr}) asks to pair", request.name);
                 let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = self.event_tx.send(ControlEvent::PairRequest {
+                let _ = self.event_tx.send(PairingEvent::Request {
                     fingerprint,
                     request,
+                    code,
                     reply: reply_tx,
                 });
                 let reply = match tokio::time::timeout(PAIR_TIMEOUT, reply_rx).await {
@@ -481,11 +518,88 @@ fn check_authorized(
     }
 }
 
-/// Short code both devices show while pairing. Matching codes mean each side
-/// talks to the certificate the other one holds (no one in between).
-pub(crate) fn pairing_code(a: &str, b: &str) -> String {
-    let (first, second) = if a <= b { (a, b) } else { (b, a) };
-    let hash = Sha256::digest(format!("lan-mouse pairing\n{first}\n{second}"));
+// Pairing code exchange (the "numeric comparison" of Bluetooth pairing):
+//
+//   requester                         responder
+//       ---- PairRequest ------------------>
+//       <--- commit = H(nonce_b) -----------   responder commits first
+//       ---- nonce_a ---------------------->
+//       <--- nonce_b (reveal) --------------   requester checks the commitment
+//
+// Both derive the code from both certificate fingerprints and both nonces.
+// Someone in the middle (with their own certificates towards each side)
+// would have to commit to nonce_b before learning nonce_a, so they can't
+// search for certificates or nonces that make both screens show the same
+// code: they get one guess in a million, and a wrong guess shows up as
+// different codes.
+
+/// Requester side of the exchange, after sending the request. Returns the
+/// code.
+async fn requester_exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    requester: &str,
+    responder: &str,
+) -> Result<String, ControlError> {
+    let commitment = read_small_frame(stream, KIND_PAIR_COMMIT).await?;
+    let nonce_a = random_nonce();
+    write_frame(stream, KIND_PAIR_NONCE, &nonce_a).await?;
+    let nonce_b = read_small_frame(stream, KIND_PAIR_REVEAL).await?;
+    if commit(&nonce_b) != commitment {
+        return Err(ControlError::CommitMismatch);
+    }
+    Ok(pairing_code(requester, responder, &nonce_a, &nonce_b))
+}
+
+/// Responder side of the exchange, after receiving the request. Returns the
+/// code.
+async fn responder_exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    requester: &str,
+    responder: &str,
+) -> Result<String, ControlError> {
+    let nonce_b = random_nonce();
+    write_frame(stream, KIND_PAIR_COMMIT, &commit(&nonce_b)).await?;
+    let nonce_a = read_small_frame(stream, KIND_PAIR_NONCE).await?;
+    write_frame(stream, KIND_PAIR_REVEAL, &nonce_b).await?;
+    Ok(pairing_code(requester, responder, &nonce_a, &nonce_b))
+}
+
+/// A 32 byte frame of the given kind (nonces and commitments).
+async fn read_small_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    expected: u8,
+) -> Result<Nonce, ControlError> {
+    let (kind, len) = read_header(stream).await?;
+    if kind != expected {
+        return Err(ControlError::UnexpectedKind(kind));
+    }
+    if len != NONCE_LEN {
+        return Err(ControlError::TooLarge(len));
+    }
+    let payload = read_payload(stream, len).await?;
+    Ok(payload.try_into().expect("length checked"))
+}
+
+fn random_nonce() -> Nonce {
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::getrandom(&mut nonce).expect("the system's random number generator failed");
+    nonce
+}
+
+fn commit(nonce: &Nonce) -> Nonce {
+    let mut hash = Sha256::new();
+    hash.update(b"lan-mouse pairing commitment\n");
+    hash.update(nonce);
+    hash.finalize().into()
+}
+
+/// The six digit code both devices show while pairing.
+fn pairing_code(requester: &str, responder: &str, nonce_a: &Nonce, nonce_b: &Nonce) -> String {
+    let mut hash = Sha256::new();
+    hash.update(format!("lan-mouse pairing v2\n{requester}\n{responder}\n"));
+    hash.update(nonce_a);
+    hash.update(nonce_b);
+    let hash = hash.finalize();
     let n = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 1_000_000;
     format!("{:03} {:03}", n / 1000, n % 1000)
 }
@@ -634,9 +748,10 @@ mod tests {
         );
 
         let answer = async {
-            let ControlEvent::PairRequest {
+            let PairingEvent::Request {
                 fingerprint,
                 request: received,
+                code,
                 reply,
             } = b.event().await
             else {
@@ -655,11 +770,18 @@ mod tests {
                 }
                 None => drop(reply),
             }
+            code
         };
+        let mut event = a.event().await;
         if !impostor {
-            answer.await;
+            let PairingEvent::Code { code, .. } = event else {
+                panic!("expected the pairing code");
+            };
+            // both screens show the same code
+            assert_eq!(answer.await, code);
+            event = a.event().await;
         }
-        let ControlEvent::PairFinished { result, pos, .. } = a.event().await else {
+        let PairingEvent::Finished { result, pos, .. } = event else {
             panic!("expected the pairing to finish");
         };
         assert_eq!(pos, Position::Right);
@@ -713,6 +835,7 @@ mod tests {
             .run_until(async {
                 let (event_tx, _event_rx) = channel();
                 let handler = Handler {
+                    own_fingerprint: "me".to_owned(),
                     authorized_keys: keys(&[]),
                     clipboard_enabled: true,
                     peer_clipboard: Default::default(),
@@ -737,6 +860,7 @@ mod tests {
             .run_until(async {
                 let (event_tx, _event_rx) = channel();
                 let handler = Handler {
+                    own_fingerprint: "me".to_owned(),
                     authorized_keys: keys(&[]),
                     clipboard_enabled: true,
                     peer_clipboard: Default::default(),
@@ -756,11 +880,45 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn the_exchange_gives_both_sides_the_same_fresh_code() {
+        let run = || async {
+            let (mut requester, mut responder) = duplex(1024);
+            let (a, b) = tokio::join!(
+                requester_exchange(&mut requester, "aa", "bb"),
+                responder_exchange(&mut responder, "aa", "bb"),
+            );
+            let (a, b) = (a.expect("requester"), b.expect("responder"));
+            assert_eq!(a, b);
+            assert_eq!(a.len(), 7);
+            a
+        };
+        // fresh nonces each time: the same two devices don't get a fixed code
+        let codes: std::collections::HashSet<_> = [run().await, run().await, run().await].into();
+        assert!(codes.len() > 1);
+    }
+
+    #[tokio::test]
+    async fn a_broken_commitment_is_detected() {
+        // someone in the middle picks their nonce after seeing ours
+        let (mut requester, mut fake) = duplex(1024);
+        let cheat = async {
+            write_frame(&mut fake, KIND_PAIR_COMMIT, &commit(&[1; NONCE_LEN])).await?;
+            let _nonce_a = read_small_frame(&mut fake, KIND_PAIR_NONCE).await?;
+            write_frame(&mut fake, KIND_PAIR_REVEAL, &[2; NONCE_LEN]).await?;
+            Ok::<_, ControlError>(())
+        };
+        let (result, _) = tokio::join!(requester_exchange(&mut requester, "aa", "bb"), cheat);
+        assert!(matches!(result, Err(ControlError::CommitMismatch)));
+    }
+
     #[test]
-    fn pairing_codes_match_on_both_sides() {
-        let code = pairing_code("aa:bb", "cc:dd");
-        assert_eq!(code, pairing_code("cc:dd", "aa:bb"));
-        assert_eq!(code.len(), 7);
-        assert_ne!(code, pairing_code("aa:bb", "cc:de"));
+    fn codes_depend_on_both_devices_and_both_nonces() {
+        let (n1, n2) = ([1; NONCE_LEN], [2; NONCE_LEN]);
+        let code = pairing_code("aa", "bb", &n1, &n2);
+        assert_ne!(code, pairing_code("aa", "bc", &n1, &n2));
+        assert_ne!(code, pairing_code("ab", "bb", &n1, &n2));
+        assert_ne!(code, pairing_code("aa", "bb", &n2, &n2));
+        assert_ne!(code, pairing_code("aa", "bb", &n1, &n1));
     }
 }

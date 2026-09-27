@@ -3,7 +3,7 @@ use crate::{
     client::ClientManager,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
-    control::{Control, ControlEvent, PairReply, PairRequest, pairing_code},
+    control::{Control, PairReply, PairRequest, PairingEvent},
     crypto,
     discovery::{self, Discovery},
     dns::{DnsEvent, DnsResolver},
@@ -467,11 +467,12 @@ impl Service {
         self.broadcast_client(handle);
     }
 
-    fn handle_control_event(&mut self, event: ControlEvent) {
+    fn handle_control_event(&mut self, event: PairingEvent) {
         match event {
-            ControlEvent::PairRequest {
+            PairingEvent::Request {
                 fingerprint,
                 request,
+                code,
                 reply,
             } => {
                 // Requests that timed out (the control channel gave up waiting
@@ -488,7 +489,6 @@ impl Service {
                     );
                     return;
                 }
-                let code = pairing_code(&self.public_key_fingerprint, &fingerprint);
                 self.notify_frontend(FrontendEvent::PairRequest {
                     fingerprint: fingerprint.clone(),
                     name: request.name.clone(),
@@ -499,7 +499,20 @@ impl Service {
                 self.pending_pairs
                     .insert(fingerprint, PendingPair { request, reply });
             }
-            ControlEvent::PairFinished {
+            PairingEvent::Code { fingerprint, code } => {
+                let name = display_name(
+                    self.discovery
+                        .as_ref()
+                        .and_then(|d| d.get(&fingerprint))
+                        .as_ref(),
+                );
+                self.notify_frontend(FrontendEvent::PairUpdate {
+                    fingerprint,
+                    name,
+                    status: PairStatus::Waiting { code },
+                });
+            }
+            PairingEvent::Finished {
                 fingerprint,
                 pos,
                 result,
@@ -600,18 +613,9 @@ impl Service {
             pos: pos.opposite(),
         };
         log::info!("asking {} to pair", peer.name);
-        control.pair(
-            SocketAddr::new(ip, peer.port),
-            fingerprint.clone(),
-            pos,
-            request,
-        );
-        let code = pairing_code(&self.public_key_fingerprint, &fingerprint);
-        self.notify_frontend(FrontendEvent::PairUpdate {
-            fingerprint,
-            name: peer.name,
-            status: PairStatus::Waiting { code },
-        });
+        // the code is known once both sides exchanged their contributions,
+        // see PairingEvent::Code
+        control.pair(SocketAddr::new(ip, peer.port), fingerprint, pos, request);
     }
 
     fn answer_pairing(&mut self, fingerprint: String, accept: bool) {
@@ -954,7 +958,7 @@ impl std::fmt::Display for HookKind {
     }
 }
 
-async fn next_control_event(control: &mut Option<Control>) -> ControlEvent {
+async fn next_control_event(control: &mut Option<Control>) -> PairingEvent {
     match control {
         Some(control) => control.event().await,
         None => std::future::pending().await,
