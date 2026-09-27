@@ -46,6 +46,9 @@ use crate::{clipboard, crypto};
 
 /// Largest message accepted or sent.
 const MAX_SIZE: usize = 16 * 1024 * 1024;
+/// Largest message accepted from a device that isn't paired: a pairing
+/// request is a few hundred bytes, and strangers must not make us allocate.
+const MAX_UNPAIRED_SIZE: usize = 4096;
 /// Gives up on a peer that does not complete a transfer in time.
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a pairing request waits for the user to answer it.
@@ -261,10 +264,21 @@ impl Handler {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let (kind, payload) = timeout(TIMEOUT, read_any_frame(tls)).await?;
+        let (kind, len) = timeout(TIMEOUT, read_header(tls)).await?;
+        // Decide what this peer may send before reading (and allocating) it.
+        let paired = check_authorized(&fingerprint, &self.authorized_keys).is_ok();
+        match kind {
+            KIND_CLIPBOARD if !paired => return Err(ControlError::Unauthorized(fingerprint)),
+            KIND_CLIPBOARD | KIND_PAIR_REQUEST => {}
+            kind => return Err(ControlError::UnexpectedKind(kind)),
+        }
+        let limit = if paired { MAX_SIZE } else { MAX_UNPAIRED_SIZE };
+        if len > limit {
+            return Err(ControlError::TooLarge(len));
+        }
+        let payload = timeout(TIMEOUT, read_payload(tls, len)).await?;
         match kind {
             KIND_CLIPBOARD => {
-                check_authorized(&fingerprint, &self.authorized_keys)?;
                 if !self.clipboard_enabled {
                     return Ok(());
                 }
@@ -367,17 +381,30 @@ async fn write_frame<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// A frame's kind and payload length, without reading the payload.
+async fn read_header<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, usize), ControlError> {
+    let kind = stream.read_u8().await?;
+    let len = stream.read_u32().await? as usize;
+    Ok((kind, len))
+}
+
+async fn read_payload<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    len: usize,
+) -> Result<Vec<u8>, ControlError> {
+    let mut payload = vec![0; len];
+    stream.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
 async fn read_any_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
 ) -> Result<(u8, Vec<u8>), ControlError> {
-    let kind = stream.read_u8().await?;
-    let len = stream.read_u32().await? as usize;
+    let (kind, len) = read_header(stream).await?;
     if len > MAX_SIZE {
         return Err(ControlError::TooLarge(len));
     }
-    let mut payload = vec![0; len];
-    stream.read_exact(&mut payload).await?;
-    Ok((kind, payload))
+    Ok((kind, read_payload(stream, len).await?))
 }
 
 async fn read_frame<S: AsyncRead + Unpin>(
@@ -664,6 +691,31 @@ mod tests {
                     .handle(&mut server, "stranger".to_owned(), addr)
                     .await;
                 assert!(matches!(result, Err(ControlError::Unauthorized(_))));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn strangers_cannot_make_us_allocate() {
+        LocalSet::new()
+            .run_until(async {
+                let (event_tx, _event_rx) = channel();
+                let handler = Handler {
+                    authorized_keys: keys(&[]),
+                    clipboard_enabled: true,
+                    peer_clipboard: Default::default(),
+                    event_tx,
+                };
+                let addr = SocketAddr::new([127, 0, 0, 1].into(), 1);
+                // only the header is sent: a pairing request claiming 1 GB
+                // must be refused without waiting for (or allocating) it
+                let (mut client, mut server) = duplex(64);
+                client.write_u8(KIND_PAIR_REQUEST).await.expect("write");
+                client.write_u32(1 << 30).await.expect("write");
+                let result = handler
+                    .handle(&mut server, "stranger".to_owned(), addr)
+                    .await;
+                assert!(matches!(result, Err(ControlError::TooLarge(_))));
             })
             .await;
     }

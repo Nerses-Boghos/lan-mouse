@@ -85,6 +85,9 @@ pub struct Service {
     next_trigger_handle: u64,
 }
 
+/// Pairing requests waiting for an answer at the same time; more are declined.
+const MAX_PENDING_PAIRS: usize = 3;
+
 #[derive(Debug)]
 struct PendingPair {
     request: PairRequest,
@@ -456,6 +459,17 @@ impl Service {
                 request,
                 reply,
             } => {
+                // Anyone on the network can ask; don't let them bury the user
+                // in dialogs. Dropping `reply` declines the request.
+                if self.pending_pairs.len() >= MAX_PENDING_PAIRS
+                    && !self.pending_pairs.contains_key(&fingerprint)
+                {
+                    log::warn!(
+                        "declined pairing request from {}: too many pending",
+                        request.name
+                    );
+                    return;
+                }
                 let code = pairing_code(&self.public_key_fingerprint, &fingerprint);
                 self.notify_frontend(FrontendEvent::PairRequest {
                     fingerprint: fingerprint.clone(),
