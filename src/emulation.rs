@@ -7,7 +7,7 @@ use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -156,6 +156,7 @@ impl ListenTask {
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
         let mut desktop = DesktopCache::default();
+        let mut placing = Placing::default();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -164,6 +165,7 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
+                                placing.entered(addr);
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
@@ -176,13 +178,20 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Leave(_) => {
+                                placing.done(addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
-                            ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
-                            ProtoEvent::CursorPosition { pos, along } => {
+                            ProtoEvent::Input(event) => {
+                                placing.done(addr);
+                                self.emulation_proxy.consume(event, addr)
+                            }
+                            ProtoEvent::CursorPosition { pos, along } if placing.may_place(addr) => {
                                 let (x, y) = entry_point(pos, along);
                                 self.emulation_proxy.warp(x, y, addr);
+                            }
+                            ProtoEvent::CursorPosition { .. } => {
+                                log::debug!("ignoring a late cursor position from {addr}");
                             }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                             // Peer's version handshake. Echo our own
@@ -470,6 +479,27 @@ impl EmulationTask {
 /// trigger the barrier again and bounce the cursor between devices.
 const ENTRY_INSET: f64 = 0.01;
 
+/// Which peers may still place the cursor: those that entered and haven't
+/// sent input (or left) since. A [`ProtoEvent::CursorPosition`] travels over
+/// UDP and can arrive late, after the user already moved, and must not yank
+/// the cursor back then.
+#[derive(Default)]
+struct Placing(HashSet<SocketAddr>);
+
+impl Placing {
+    fn entered(&mut self, peer: SocketAddr) {
+        self.0.insert(peer);
+    }
+
+    fn done(&mut self, peer: SocketAddr) {
+        self.0.remove(&peer);
+    }
+
+    fn may_place(&self, peer: SocketAddr) -> bool {
+        self.0.contains(&peer)
+    }
+}
+
 /// This desktop's size for peers, measured at most every few seconds:
 /// peers get it with every crossing, and measuring talks to the compositor.
 #[derive(Default)]
@@ -543,5 +573,38 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_fresh_entry_may_place_the_cursor() {
+        let (a, b): (SocketAddr, SocketAddr) = (
+            "10.0.0.1:4242".parse().unwrap(),
+            "10.0.0.2:4242".parse().unwrap(),
+        );
+        let mut placing = Placing::default();
+        assert!(!placing.may_place(a), "no entry, no placement");
+        placing.entered(a);
+        assert!(placing.may_place(a));
+        assert!(!placing.may_place(b), "per peer");
+        placing.done(a); // first input arrived
+        assert!(
+            !placing.may_place(a),
+            "a late position must not move the cursor"
+        );
+        placing.entered(a); // the next crossing
+        assert!(placing.may_place(a));
+    }
+
+    #[test]
+    fn entry_points_sit_just_inside_the_edge() {
+        let (x, y) = entry_point(Position::Left, u16::MAX / 2);
+        assert!(x > 0.0 && x < 0.05 && (y - 0.5).abs() < 0.001);
+        let (x, _) = entry_point(Position::Right, 0);
+        assert!(x < 1.0 && x > 0.95);
     }
 }
