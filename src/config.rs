@@ -501,7 +501,6 @@ impl Config {
             .collect()
     }
 
-    /// release bind for returning control to the host
     /// the name shown to other devices, if configured
     pub fn name(&self) -> Option<String> {
         self.config_toml
@@ -518,6 +517,7 @@ impl Config {
             .unwrap_or(true)
     }
 
+    /// release bind for returning control to the host
     pub fn release_bind(&self) -> Vec<scancode::Linux> {
         self.config_toml
             .as_ref()

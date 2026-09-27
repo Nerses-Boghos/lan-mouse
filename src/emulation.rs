@@ -155,6 +155,7 @@ impl ListenTask {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
+        let mut desktop = DesktopCache::default();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -167,6 +168,10 @@ impl ListenTask {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                    // keep the peer's idea of this desktop current (monitors come and go)
+                                    if let Some(size) = desktop.size_event() {
+                                        self.listener.reply(addr, size).await;
+                                    }
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                 }
                             }
@@ -194,8 +199,7 @@ impl ListenTask {
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
                                 // let the peer line up its screen edge with this desktop
-                                if let Some(desktop) = input_capture::desktop_bounds() {
-                                    let size = ProtoEvent::DesktopSize { width: desktop.width, height: desktop.height };
+                                if let Some(size) = desktop.size_event() {
                                     self.listener.reply(addr, size).await;
                                 }
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
@@ -465,6 +469,29 @@ impl EmulationTask {
 /// desktop. Placing it on the edge itself lets the slightest movement back
 /// trigger the barrier again and bounce the cursor between devices.
 const ENTRY_INSET: f64 = 0.01;
+
+/// This desktop's size for peers, measured at most every few seconds:
+/// peers get it with every crossing, and measuring talks to the compositor.
+#[derive(Default)]
+struct DesktopCache(Option<(Instant, input_capture::DesktopBounds)>);
+
+impl DesktopCache {
+    fn size_event(&mut self) -> Option<ProtoEvent> {
+        const FRESH: Duration = Duration::from_secs(5);
+        let bounds = match self.0 {
+            Some((at, bounds)) if at.elapsed() < FRESH => bounds,
+            _ => {
+                let bounds = input_capture::desktop_bounds()?;
+                self.0 = Some((Instant::now(), bounds));
+                bounds
+            }
+        };
+        Some(ProtoEvent::DesktopSize {
+            width: bounds.width,
+            height: bounds.height,
+        })
+    }
+}
 
 /// Desktop fractions `(x, y)` of the point `along` the entry edge `pos`.
 fn entry_point(pos: Position, along: u16) -> (f64, f64) {

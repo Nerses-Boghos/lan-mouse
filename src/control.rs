@@ -18,7 +18,7 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use lan_mouse_ipc::Position;
@@ -37,7 +37,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
-    task::spawn_local,
+    task::{JoinHandle, spawn_local},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use webrtc_dtls::crypto::Certificate;
@@ -51,6 +51,9 @@ const MAX_SIZE: usize = 16 * 1024 * 1024;
 const MAX_UNPAIRED_SIZE: usize = 4096;
 /// Gives up on a peer that does not complete a transfer in time.
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to assume a peer still has the clipboard content it last
+/// exchanged with us, so crossing back and forth doesn't resend it.
+const CLIPBOARD_MEMORY: Duration = Duration::from_secs(10);
 /// How long a pairing request waits for the user to answer it.
 pub(crate) const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -116,16 +119,21 @@ pub(crate) enum ControlEvent {
 }
 
 type AuthorizedKeys = Arc<RwLock<HashMap<String, String>>>;
+/// Per peer address: hash of the clipboard content last exchanged, and when.
+type PeerClipboards = Rc<RefCell<HashMap<std::net::IpAddr, ([u8; 32], Instant)>>>;
 
 pub(crate) struct Control {
     /// the TCP port listened on (only read by tests, which bind port 0)
     #[cfg_attr(not(test), allow(dead_code))]
     port: u16,
+    acceptor: TlsAcceptor,
+    handler: Handler,
+    accept_task: JoinHandle<()>,
     connector: TlsConnector,
     authorized_keys: AuthorizedKeys,
     clipboard_enabled: bool,
     /// hash of the clipboard each peer (by ip) is known to have
-    peer_clipboard: Rc<RefCell<HashMap<std::net::IpAddr, [u8; 32]>>>,
+    peer_clipboard: PeerClipboards,
     event_tx: Sender<ControlEvent>,
     event_rx: Receiver<ControlEvent>,
 }
@@ -149,11 +157,14 @@ impl Control {
             peer_clipboard: peer_clipboard.clone(),
             event_tx: event_tx.clone(),
         };
-        spawn_local(accept_loop(listener, acceptor, handler));
+        let accept_task = spawn_local(accept_loop(listener, acceptor.clone(), handler.clone()));
         log::info!("control channel listening on tcp port {port}");
 
         Ok(Self {
             port,
+            acceptor,
+            handler,
+            accept_task,
             connector,
             authorized_keys,
             clipboard_enabled,
@@ -161,6 +172,23 @@ impl Control {
             event_tx,
             event_rx,
         })
+    }
+
+    /// Move to another TCP port, following the input channel. Binding
+    /// happens in the background; failures are logged.
+    pub(crate) fn rebind(&mut self, port: u16) {
+        self.accept_task.abort();
+        self.port = port;
+        let (acceptor, handler) = (self.acceptor.clone(), self.handler.clone());
+        self.accept_task = spawn_local(async move {
+            match TcpListener::bind(SocketAddr::new([0, 0, 0, 0].into(), port)).await {
+                Ok(listener) => {
+                    log::info!("control channel listening on tcp port {port}");
+                    accept_loop(listener, acceptor, handler).await
+                }
+                Err(e) => log::warn!("control channel can't listen on tcp port {port}: {e}"),
+            }
+        });
     }
 
     #[cfg(test)]
@@ -191,7 +219,13 @@ impl Control {
                 }
             };
             let hash = digest(&text);
-            if peer_clipboard.borrow().get(&addr.ip()) == Some(&hash) {
+            // Skip resending what the peer got moments ago (crossing back and
+            // forth). Only briefly: it may have copied something else since.
+            if peer_clipboard
+                .borrow()
+                .get(&addr.ip())
+                .is_some_and(|(h, at)| *h == hash && at.elapsed() < CLIPBOARD_MEMORY)
+            {
                 return;
             }
             let transfer = async {
@@ -204,7 +238,9 @@ impl Control {
             match timeout(TIMEOUT, transfer).await {
                 Ok(()) => {
                     log::info!("sent clipboard ({} bytes) to {addr}", text.len());
-                    peer_clipboard.borrow_mut().insert(addr.ip(), hash);
+                    peer_clipboard
+                        .borrow_mut()
+                        .insert(addr.ip(), (hash, Instant::now()));
                 }
                 Err(e) => log::warn!("could not send clipboard to {addr}: {e}"),
             }
@@ -250,7 +286,7 @@ impl Control {
 struct Handler {
     authorized_keys: AuthorizedKeys,
     clipboard_enabled: bool,
-    peer_clipboard: Rc<RefCell<HashMap<std::net::IpAddr, [u8; 32]>>>,
+    peer_clipboard: PeerClipboards,
     event_tx: Sender<ControlEvent>,
 }
 
@@ -286,7 +322,7 @@ impl Handler {
                 // the sender has this content now, no need to send it back
                 self.peer_clipboard
                     .borrow_mut()
-                    .insert(addr.ip(), digest(&payload));
+                    .insert(addr.ip(), (digest(&payload), Instant::now()));
                 log::info!("received clipboard ({} bytes) from {addr}", payload.len());
                 Ok(())
             }

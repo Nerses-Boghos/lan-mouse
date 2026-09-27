@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -85,7 +86,8 @@ impl Capture {
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
             conn,
-            last_send_failure: None,
+            last_send_failure: Default::default(),
+            desktop: Default::default(),
             entry_along: None,
             event_tx,
             request_rx,
@@ -174,8 +176,11 @@ struct CaptureTask {
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: LanMouseConnection,
-    /// when sending to a client last failed, see [`RETRY_COOLDOWN`]
-    last_send_failure: Option<Instant>,
+    /// this desktop's bounds and when they were measured, see
+    /// [`CaptureTask::local_desktop`]
+    desktop: RefCell<Option<(Instant, input_capture::DesktopBounds)>>,
+    /// when sending to each client last failed, see [`RETRY_COOLDOWN`]
+    last_send_failure: HashMap<CaptureHandle, Instant>,
     /// where the cursor crossed into the active client, re-sent with every `Enter`
     entry_along: Option<u16>,
     event_tx: Sender<ICaptureEvent>,
@@ -359,6 +364,7 @@ impl CaptureTask {
         if matches!(event, CaptureEvent::Begin { .. })
             && self
                 .last_send_failure
+                .get(&handle)
                 .is_some_and(|t| t.elapsed() < RETRY_COOLDOWN)
         {
             return capture.release().await;
@@ -420,7 +426,7 @@ impl CaptureTask {
         }
 
         if let Err(e) = result {
-            self.last_send_failure = Some(Instant::now());
+            self.last_send_failure.insert(handle, Instant::now());
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
             // Funnel through release_capture so the leave_hook
@@ -451,7 +457,7 @@ impl CaptureTask {
             return Some(Some(along));
         };
         let pos = arrangement.pos;
-        let Some(local) = input_capture::desktop_bounds() else {
+        let Some(local) = self.local_desktop() else {
             return Some(Some(along));
         };
         let (local_len, peer_len) = match pos {
@@ -463,6 +469,21 @@ impl CaptureTask {
             }
         };
         arranged_crossing(along, local_len, offset, peer_len)
+    }
+
+    /// This desktop's bounds. Measuring them talks to the compositor, and a
+    /// refused crossing is retried on every pointer motion against the edge,
+    /// so reuse a recent measurement.
+    fn local_desktop(&self) -> Option<input_capture::DesktopBounds> {
+        const FRESH: Duration = Duration::from_secs(5);
+        if let Some((at, bounds)) = *self.desktop.borrow() {
+            if at.elapsed() < FRESH {
+                return Some(bounds);
+            }
+        }
+        let bounds = input_capture::desktop_bounds()?;
+        self.desktop.replace(Some((Instant::now(), bounds)));
+        Some(bounds)
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {

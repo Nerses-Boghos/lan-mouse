@@ -1,6 +1,6 @@
 mod imp;
 
-use std::collections::HashMap;
+use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -558,37 +558,43 @@ impl Window {
         if self.is_visible() {
             window.set_transient_for(Some(self));
         }
-        let fp = fingerprint.clone();
+        // Exactly one answer per request: the buttons answer and close the
+        // dialog; closing it any other way (window button, Escape) declines.
+        let answered = Rc::new(Cell::new(false));
+        let answer = {
+            let parent = self.clone();
+            let answered = answered.clone();
+            move |accept: bool| {
+                if !answered.replace(true) {
+                    parent.request(FrontendRequest::PairResponse {
+                        fingerprint: fingerprint.clone(),
+                        accept,
+                    });
+                }
+            }
+        };
+        let on_accept = answer.clone();
         window.connect_closure(
             "accepted",
             false,
-            closure_local!(
-                #[strong(rename_to = parent)]
-                self,
-                move |w: PairWindow| {
-                    w.close();
-                    parent.request(FrontendRequest::PairResponse {
-                        fingerprint: fp.clone(),
-                        accept: true,
-                    });
-                }
-            ),
+            closure_local!(move |w: PairWindow| {
+                on_accept(true);
+                w.close();
+            }),
         );
+        let on_decline = answer.clone();
         window.connect_closure(
             "declined",
             false,
-            closure_local!(
-                #[strong(rename_to = parent)]
-                self,
-                move |w: PairWindow| {
-                    w.close();
-                    parent.request(FrontendRequest::PairResponse {
-                        fingerprint: fingerprint.clone(),
-                        accept: false,
-                    });
-                }
-            ),
+            closure_local!(move |w: PairWindow| {
+                on_decline(false);
+                w.close();
+            }),
         );
+        window.connect_close_request(move |_| {
+            answer(false);
+            glib::Propagation::Proceed
+        });
         window.present();
         self.imp().pair_window.replace(Some(window));
     }

@@ -148,6 +148,32 @@ struct Window {
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     pos: Position,
+    /// the output's logical position, to place a crossing on the desktop
+    origin: (i32, i32),
+}
+
+impl State {
+    /// Where the pointer entered `window` (at surface coordinates `x`, `y`)
+    /// along that side of the whole desktop, see [`crate::edge_fraction`].
+    fn crossing_fraction(&self, window: &Window, x: f64, y: f64) -> Option<u16> {
+        let infos = self.outputs.iter().filter_map(|o| o.info.as_ref());
+        let vertical = matches!(window.pos, Position::Left | Position::Right);
+        let (start, end) = infos
+            .map(|i| {
+                if vertical {
+                    (i.position.1, i.position.1 + i.size.1)
+                } else {
+                    (i.position.0, i.position.0 + i.size.0)
+                }
+            })
+            .reduce(|(s1, e1), (s2, e2)| (s1.min(s2), e1.max(e2)))?;
+        let value = if vertical {
+            window.origin.1 as f64 + y
+        } else {
+            window.origin.0 as f64 + x
+        };
+        Some(crate::edge_fraction(value, start as f64, end as f64))
+    }
 }
 
 impl Window {
@@ -156,6 +182,7 @@ impl Window {
         qh: &QueueHandle<State>,
         output: &WlOutput,
         pos: Position,
+        origin: (i32, i32),
         size: (i32, i32),
     ) -> Window {
         log::debug!("creating window output: {output:?}, size: {size:?}");
@@ -204,6 +231,7 @@ impl Window {
         surface.commit();
         Window {
             pos,
+            origin,
             buffer,
             surface,
             layer_surface,
@@ -523,7 +551,8 @@ impl State {
         );
         outputs.iter().for_each(|o| {
             if let Some(info) = o.info.as_ref() {
-                let window = Window::new(self, &self.qh, &o.wl_output, pos, info.size);
+                let window =
+                    Window::new(self, &self.qh, &o.wl_output, pos, info.position, info.size);
                 let window = Arc::new(window);
                 self.active_windows.push(window);
             }
@@ -721,8 +750,8 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::Enter {
                 serial,
                 surface,
-                surface_x: _,
-                surface_y: _,
+                surface_x,
+                surface_y,
             } => {
                 // get client corresponding to the focused surface
                 {
@@ -733,14 +762,15 @@ impl Dispatch<WlPointer, ()> for State {
                         return;
                     }
                 }
-                let pos = app
+                let window = app
                     .active_windows
                     .iter()
                     .find(|w| w.surface == surface)
-                    .map(|w| w.pos)
-                    .unwrap();
+                    .expect("focused window")
+                    .clone();
+                let along = app.crossing_fraction(&window, surface_x, surface_y);
                 app.pending_events
-                    .push_back((pos, CaptureEvent::Begin { along: None }));
+                    .push_back((window.pos, CaptureEvent::Begin { along }));
             }
             wl_pointer::Event::Leave { .. } => {
                 /* There are rare cases, where when a window is opened in

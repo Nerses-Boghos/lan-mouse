@@ -17,6 +17,11 @@ const PROTOCOL_VERSION: &str = "1";
 pub(crate) struct Discovery {
     daemon: ServiceDaemon,
     events: Receiver<ServiceEvent>,
+    /// what this device announces as, to announce it again (port change)
+    name: String,
+    host: String,
+    /// the registered announcement's full name
+    announced: String,
     own_fingerprint: String,
     /// discovered devices by their mDNS full name
     peers: HashMap<String, DiscoveredPeer>,
@@ -34,15 +39,17 @@ impl Discovery {
         // Loopback addresses would lead other devices back to themselves.
         daemon.disable_interface(vec![IfKind::LoopbackV4, IfKind::LoopbackV6])?;
         let host = format!("{hostname}.");
-        let properties = [("fp", fingerprint), ("v", PROTOCOL_VERSION)];
-        let info = ServiceInfo::new(SERVICE_TYPE, name, &host, "", port, &properties[..])?
-            .enable_addr_auto();
+        let info = announcement(name, &host, port, fingerprint)?;
+        let announced = info.get_fullname().to_owned();
         daemon.register(info)?;
         let events = daemon.browse(SERVICE_TYPE)?;
         log::info!("announcing this device as \"{name}\" ({host})");
         Ok(Self {
             daemon,
             events,
+            name: name.to_owned(),
+            host,
+            announced,
             own_fingerprint: fingerprint.to_owned(),
             peers: HashMap::new(),
         })
@@ -81,6 +88,20 @@ impl Discovery {
             .values()
             .find(|p| p.fingerprint == fingerprint)
             .cloned()
+    }
+
+    /// Announce this device at another port.
+    pub(crate) fn set_port(&mut self, port: u16) {
+        let _ = self.daemon.unregister(&self.announced);
+        let registered = announcement(&self.name, &self.host, port, &self.own_fingerprint)
+            .and_then(|info| {
+                let fullname = info.get_fullname().to_owned();
+                self.daemon.register(info).map(|()| fullname)
+            });
+        match registered {
+            Ok(fullname) => self.announced = fullname,
+            Err(e) => log::warn!("could not announce this device at port {port}: {e}"),
+        }
     }
 
     pub(crate) fn terminate(&self) {
@@ -136,24 +157,43 @@ impl Discovery {
     }
 }
 
+/// The DNS-SD record announcing this device.
+fn announcement(
+    name: &str,
+    host: &str,
+    port: u16,
+    fingerprint: &str,
+) -> Result<ServiceInfo, mdns_sd::Error> {
+    let properties = [("fp", fingerprint), ("v", PROTOCOL_VERSION)];
+    Ok(ServiceInfo::new(SERVICE_TYPE, name, host, "", port, &properties[..])?.enable_addr_auto())
+}
+
 /// This machine's host name, without a `.local` suffix.
 pub(crate) fn local_name() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: the buffer is valid for its length; gethostname NUL-terminates
-    // on success (truncation is fine for a display name).
-    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
-    let name = if ok {
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        String::from_utf8_lossy(&buf[..end]).into_owned()
-    } else {
-        String::new()
-    };
+    let name = os_host_name();
     let name = name.trim_end_matches(".local").trim();
     if name.is_empty() {
         "lan-mouse".to_owned()
     } else {
         name.to_owned()
     }
+}
+
+#[cfg(unix)]
+fn os_host_name() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for its length; gethostname NUL-terminates
+    // on success (truncation is fine for a display name).
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+#[cfg(not(unix))]
+fn os_host_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
 }
 
 /// The `.local` host name this machine is reachable under (answered by the

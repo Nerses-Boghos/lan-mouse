@@ -197,7 +197,10 @@ impl Service {
                     }
                 }
                 event = next_control_event(&mut self.control) => self.handle_control_event(event),
-                _ = discovery_changed(&mut self.discovery) => self.broadcast_discovered(),
+                _ = discovery_changed(&mut self.discovery) => {
+                    self.update_announced_ips();
+                    self.broadcast_discovered();
+                }
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -369,6 +372,13 @@ impl Service {
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
                     self.port = port;
+                    // clipboard, pairing and the announcement follow the input port
+                    if let Some(control) = &mut self.control {
+                        control.rebind(port);
+                    }
+                    if let Some(discovery) = &mut self.discovery {
+                        discovery.set_port(port);
+                    }
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self
@@ -444,7 +454,12 @@ impl Service {
                 if let Err(e) = &ips {
                     log::warn!("could not resolve {hostname}: {e}");
                 }
-                let ips = ips.unwrap_or_default();
+                let mut ips = ips.unwrap_or_default();
+                // where name lookup fails (no mDNS resolver), fall back to
+                // the addresses the device announces itself
+                if ips.is_empty() {
+                    ips = self.announced_ips(handle).unwrap_or_default();
+                }
                 self.client_manager.set_dns_ips(handle, ips);
                 handle
             }
@@ -459,6 +474,9 @@ impl Service {
                 request,
                 reply,
             } => {
+                // Requests that timed out (the control channel gave up waiting
+                // and dropped its end) no longer count.
+                self.pending_pairs.retain(|_, p| !p.reply.is_closed());
                 // Anyone on the network can ask; don't let them bury the user
                 // in dialogs. Dropping `reply` declines the request.
                 if self.pending_pairs.len() >= MAX_PENDING_PAIRS
@@ -512,6 +530,34 @@ impl Service {
                     name,
                     status,
                 });
+            }
+        }
+    }
+
+    /// Addresses the device behind client `handle` announces on the network.
+    fn announced_ips(&self, handle: ClientHandle) -> Option<Vec<IpAddr>> {
+        let (config, _) = self.client_manager.get_state(handle)?;
+        let hostname = config.hostname?;
+        self.discovery
+            .as_ref()?
+            .peers(|_| false)
+            .into_iter()
+            .find(|p| p.port == config.port && same_host(&p.hostname, &hostname))
+            .map(|p| p.ips)
+            .filter(|ips| !ips.is_empty())
+    }
+
+    /// Discovery follows devices as their addresses change (new network,
+    /// new DHCP lease): hand the new addresses to their clients right away.
+    fn update_announced_ips(&mut self) {
+        for (handle, _, state) in self.client_manager.get_client_states() {
+            let Some(ips) = self.announced_ips(handle) else {
+                continue;
+            };
+            if ips.iter().any(|ip| !state.ips.contains(ip)) {
+                log::info!("client {handle} is now announced at {ips:?}");
+                self.client_manager.set_dns_ips(handle, ips);
+                self.broadcast_client(handle);
             }
         }
     }
