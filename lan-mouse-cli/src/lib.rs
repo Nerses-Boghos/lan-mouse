@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
 
-use std::{net::IpAddr, time::Duration};
+use std::{io::IsTerminal, net::IpAddr, time::Duration};
 use thiserror::Error;
 
 use lan_mouse_ipc::{
@@ -73,6 +73,11 @@ enum CliSubcommand {
     PairAccept { fingerprint: String },
     /// decline a pairing request
     PairDecline { fingerprint: String },
+    /// confirm that the other device shows the same code, for a pairing
+    /// started here (`pair` asks by itself when run in a terminal)
+    PairConfirm { fingerprint: String },
+    /// cancel a pairing started here, e.g. because the codes differ
+    PairCancel { fingerprint: String },
     /// print service events as JSON lines until interrupted
     Watch,
     /// change hostname
@@ -251,7 +256,27 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 }
                 match status {
                     PairStatus::Waiting { code } => {
-                        println!("Confirm the pairing on {name}. It should show the code {code}.")
+                        println!("{name} shows a pairing request with a code. Accept it there.");
+                        let confirm = if std::io::stdin().is_terminal() {
+                            ask(&format!("Does {name} show the code {code}? [y/N] ")).await
+                        } else {
+                            // another frontend (e.g. a bar widget) confirms
+                            println!(
+                                "It should show the code {code}. Confirm with: lan-mouse cli pair-confirm {fingerprint}"
+                            );
+                            continue;
+                        };
+                        tx.request(FrontendRequest::PairConfirm {
+                            fingerprint: fingerprint.clone(),
+                            confirm,
+                        })
+                        .await?;
+                        if !confirm {
+                            return Err(CliError::Failed(
+                                "pairing cancelled: the codes must match".to_owned(),
+                            ));
+                        }
+                        println!("Waiting for {name}...");
                     }
                     PairStatus::Paired => {
                         let place = pos.relative_phrase();
@@ -271,6 +296,20 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             tx.request(FrontendRequest::PairResponse {
                 fingerprint,
                 accept: true,
+            })
+            .await?
+        }
+        CliSubcommand::PairConfirm { fingerprint } => {
+            tx.request(FrontendRequest::PairConfirm {
+                fingerprint,
+                confirm: true,
+            })
+            .await?
+        }
+        CliSubcommand::PairCancel { fingerprint } => {
+            tx.request(FrontendRequest::PairConfirm {
+                fingerprint,
+                confirm: false,
             })
             .await?
         }
@@ -331,6 +370,19 @@ fn find_device<'a>(
             "\"{query}\" matches several devices, use the fingerprint"
         ))),
     }
+}
+
+/// Asks a yes/no question on the terminal; anything but "y"/"yes" is no.
+async fn ask(question: &str) -> bool {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut stdout = tokio::io::stdout();
+    let _ = stdout.write_all(question.as_bytes()).await;
+    let _ = stdout.flush().await;
+    let mut line = String::new();
+    let _ = BufReader::new(tokio::io::stdin())
+        .read_line(&mut line)
+        .await;
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 fn print_json(value: &impl serde::Serialize) {

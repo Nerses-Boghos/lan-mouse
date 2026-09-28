@@ -12,7 +12,7 @@ use mdns_sd::{IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
 /// Bump when the pairing / control protocol changes incompatibly.
-const PROTOCOL_VERSION: &str = "2";
+const PROTOCOL_VERSION: &str = "3";
 
 pub(crate) struct Discovery {
     daemon: ServiceDaemon,
@@ -116,6 +116,16 @@ impl Discovery {
                     return false;
                 };
                 if fingerprint == self.own_fingerprint {
+                    return false;
+                }
+                // Pairing changed incompatibly between versions: an older
+                // device would only end up paired on one side.
+                let version = info.get_property_val_str("v").unwrap_or("");
+                if version != PROTOCOL_VERSION {
+                    log::info!(
+                        "ignoring {} (protocol version {version:?}, this device speaks {PROTOCOL_VERSION}): update it",
+                        info.get_fullname()
+                    );
                     return false;
                 }
                 let fullname = info.get_fullname();

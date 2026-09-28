@@ -337,6 +337,9 @@ pub enum FrontendRequest {
     Pair { fingerprint: String, pos: Position },
     /// accept or decline a [`FrontendEvent::PairRequest`]
     PairResponse { fingerprint: String, accept: bool },
+    /// confirm (or reject) that the other device shows the same code, for a
+    /// pairing this device started; see [`PairStatus::Waiting`]
+    PairConfirm { fingerprint: String, confirm: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

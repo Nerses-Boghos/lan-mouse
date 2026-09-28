@@ -165,7 +165,6 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
-                                placing.entered(addr);
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
@@ -178,12 +177,12 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Leave(_) => {
-                                placing.done(addr);
+                                placing.left(addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(event) => {
-                                placing.done(addr);
+                                placing.moved(addr);
                                 self.emulation_proxy.consume(event, addr)
                             }
                             ProtoEvent::CursorPosition { pos, along } if placing.may_place(addr) => {
@@ -254,6 +253,7 @@ impl ListenTask {
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > PEER_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
+                            placing.left(addr);
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                             false
@@ -479,24 +479,32 @@ impl EmulationTask {
 /// trigger the barrier again and bounce the cursor between devices.
 const ENTRY_INSET: f64 = 0.01;
 
-/// Which peers may still place the cursor: those that entered and haven't
-/// sent input (or left) since. A [`ProtoEvent::CursorPosition`] travels over
-/// UDP and can arrive late, after the user already moved, and must not yank
-/// the cursor back then.
+/// Which peers may still place the cursor. A peer entering this device sends
+/// its entry point ([`ProtoEvent::CursorPosition`]) next to `Enter`, over UDP,
+/// so it can arrive late, after the user already moved, and must not yank
+/// the cursor back then. Arrival order proves nothing (`Enter` and the
+/// position are repeated until acknowledged, and datagrams get reordered),
+/// so track the peer's visit instead: it may place the cursor from leaving
+/// (or connecting) until its first input on the next visit.
 #[derive(Default)]
-struct Placing(HashSet<SocketAddr>);
+struct Placing {
+    /// peers that sent input since they last left
+    moving: HashSet<SocketAddr>,
+}
 
 impl Placing {
-    fn entered(&mut self, peer: SocketAddr) {
-        self.0.insert(peer);
+    /// input from `peer`: its visit is under way
+    fn moved(&mut self, peer: SocketAddr) {
+        self.moving.insert(peer);
     }
 
-    fn done(&mut self, peer: SocketAddr) {
-        self.0.remove(&peer);
+    /// `peer` left (or went away): its next visit may place the cursor
+    fn left(&mut self, peer: SocketAddr) {
+        self.moving.remove(&peer);
     }
 
     fn may_place(&self, peer: SocketAddr) -> bool {
-        self.0.contains(&peer)
+        !self.moving.contains(&peer)
     }
 }
 
@@ -581,23 +589,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_fresh_entry_may_place_the_cursor() {
+    fn placement_is_only_accepted_before_the_first_movement() {
         let (a, b): (SocketAddr, SocketAddr) = (
             "10.0.0.1:4242".parse().unwrap(),
             "10.0.0.2:4242".parse().unwrap(),
         );
         let mut placing = Placing::default();
-        assert!(!placing.may_place(a), "no entry, no placement");
-        placing.entered(a);
+        // first visit, even if the position arrives before Enter
         assert!(placing.may_place(a));
-        assert!(!placing.may_place(b), "per peer");
-        placing.done(a); // first input arrived
+        placing.moved(a);
         assert!(
             !placing.may_place(a),
             "a late position must not move the cursor"
         );
-        placing.entered(a); // the next crossing
-        assert!(placing.may_place(a));
+        // a late, repeated Enter doesn't change that: Enter isn't tracked at all
+        assert!(!placing.may_place(a));
+        assert!(placing.may_place(b), "per peer");
+        placing.left(a);
+        assert!(placing.may_place(a), "the next visit may place it again");
     }
 
     #[test]

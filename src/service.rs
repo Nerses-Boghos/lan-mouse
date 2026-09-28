@@ -64,6 +64,9 @@ pub struct Service {
     hostname: String,
     /// pairing requests waiting for the user's answer, by fingerprint
     pending_pairs: HashMap<String, PendingPair>,
+    /// pairings this device started, by fingerprint: where the user's
+    /// confirmation of the code goes
+    outgoing_pairs: HashMap<String, oneshot::Sender<bool>>,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -91,6 +94,7 @@ const MAX_PENDING_PAIRS: usize = 3;
 #[derive(Debug)]
 struct PendingPair {
     request: PairRequest,
+    code: String,
     reply: oneshot::Sender<PairReply>,
 }
 
@@ -157,6 +161,7 @@ impl Service {
             name,
             hostname,
             pending_pairs: Default::default(),
+            outgoing_pairs: Default::default(),
             public_key_fingerprint,
             client_manager,
             frontend_event_pending: Default::default(),
@@ -286,6 +291,10 @@ impl Service {
                 fingerprint,
                 accept,
             } => self.answer_pairing(fingerprint, accept),
+            FrontendRequest::PairConfirm {
+                fingerprint,
+                confirm,
+            } => self.confirm_pairing(fingerprint, confirm),
         }
     }
 
@@ -492,12 +501,41 @@ impl Service {
                 self.notify_frontend(FrontendEvent::PairRequest {
                     fingerprint: fingerprint.clone(),
                     name: request.name.clone(),
-                    code,
+                    code: code.clone(),
                     pos: request.pos,
                 });
                 // a newer request from the same device replaces (declines) the old one
-                self.pending_pairs
-                    .insert(fingerprint, PendingPair { request, reply });
+                self.pending_pairs.insert(
+                    fingerprint,
+                    PendingPair {
+                        request,
+                        code,
+                        reply,
+                    },
+                );
+            }
+            PairingEvent::Confirmed {
+                fingerprint,
+                request,
+                confirmed,
+            } => {
+                let status = if confirmed {
+                    self.complete_pairing(
+                        &fingerprint,
+                        &request.name,
+                        &request.hostname,
+                        request.port,
+                        request.pos,
+                    );
+                    PairStatus::Paired
+                } else {
+                    PairStatus::Declined
+                };
+                self.notify_frontend(FrontendEvent::PairUpdate {
+                    fingerprint,
+                    name: request.name,
+                    status,
+                });
             }
             PairingEvent::Code { fingerprint, code } => {
                 let name = display_name(
@@ -517,6 +555,7 @@ impl Service {
                 pos,
                 result,
             } => {
+                self.outgoing_pairs.remove(&fingerprint);
                 let known = self.discovery.as_ref().and_then(|d| d.get(&fingerprint));
                 let (name, status) = match result {
                     Ok(reply) if reply.accepted => {
@@ -606,6 +645,12 @@ impl Service {
             });
             return;
         };
+        // one pairing per device at a time: a second click would start
+        // another exchange with a different code
+        if self.outgoing_pairs.contains_key(&fingerprint) {
+            log::info!("already pairing with {}", peer.name);
+            return;
+        }
         let request = PairRequest {
             name: self.name.clone(),
             hostname: self.hostname.clone(),
@@ -613,13 +658,36 @@ impl Service {
             pos: pos.opposite(),
         };
         log::info!("asking {} to pair", peer.name);
-        // the code is known once both sides exchanged their contributions,
-        // see PairingEvent::Code
-        control.pair(SocketAddr::new(ip, peer.port), fingerprint, pos, request);
+        // the code is known once both sides exchanged their contributions
+        // (PairingEvent::Code); the user then confirms it (confirm_pairing)
+        let (confirm_tx, confirm_rx) = oneshot::channel();
+        self.outgoing_pairs.insert(fingerprint.clone(), confirm_tx);
+        control.pair(
+            SocketAddr::new(ip, peer.port),
+            fingerprint,
+            pos,
+            request,
+            confirm_rx,
+        );
+    }
+
+    /// The user compared the code of a pairing this device started.
+    fn confirm_pairing(&mut self, fingerprint: String, confirm: bool) {
+        match self.outgoing_pairs.remove(&fingerprint) {
+            Some(tx) => {
+                let _ = tx.send(confirm);
+            }
+            None => log::warn!("no pairing with {fingerprint} to confirm"),
+        }
     }
 
     fn answer_pairing(&mut self, fingerprint: String, accept: bool) {
-        let Some(PendingPair { request, reply }) = self.pending_pairs.remove(&fingerprint) else {
+        let Some(PendingPair {
+            request,
+            code,
+            reply,
+        }) = self.pending_pairs.remove(&fingerprint)
+        else {
             log::warn!("no pending pairing request from {fingerprint}");
             return;
         };
@@ -638,15 +706,10 @@ impl Service {
             });
             return;
         }
+        // Accepting isn't enough: the other device's user confirms the code
+        // too, and only then is it trusted (PairingEvent::Confirmed).
         let status = if accept {
-            self.complete_pairing(
-                &fingerprint,
-                &request.name,
-                &request.hostname,
-                request.port,
-                request.pos,
-            );
-            PairStatus::Paired
+            PairStatus::Waiting { code }
         } else {
             PairStatus::Declined
         };

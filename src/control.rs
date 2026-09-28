@@ -12,7 +12,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     io,
     net::SocketAddr,
@@ -63,6 +63,15 @@ const KIND_PAIR_REPLY: u8 = 3;
 const KIND_PAIR_COMMIT: u8 = 4;
 const KIND_PAIR_NONCE: u8 = 5;
 const KIND_PAIR_REVEAL: u8 = 6;
+const KIND_PAIR_CONFIRM: u8 = 7;
+/// Sent instead of a commitment while pairing attempts are rate limited.
+const KIND_PAIR_BUSY: u8 = 8;
+
+/// At most this many pairing code exchanges per [`EXCHANGE_WINDOW`], across
+/// all devices. Each exchange gives a fresh random code; unlimited exchanges
+/// would let someone in the middle retry until a code matches.
+const MAX_EXCHANGES: usize = 3;
+const EXCHANGE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Random contribution of each side to the pairing code.
 const NONCE_LEN: usize = 32;
@@ -86,6 +95,12 @@ pub(crate) enum ControlError {
     UnexpectedKind(u8),
     #[error("the other device broke its pairing commitment (someone may be interfering)")]
     CommitMismatch,
+    #[error("message of {0} bytes has the wrong length")]
+    BadLength(usize),
+    #[error("the other device refuses pairing attempts for a minute; try again then")]
+    TooManyAttempts,
+    #[error("cancelled on this device")]
+    Cancelled,
     #[error("timed out")]
     Timeout,
 }
@@ -113,12 +128,21 @@ pub(crate) struct PairReply {
 
 pub(crate) enum PairingEvent {
     /// A device asks to pair. Answer through `reply`; dropping it declines.
+    /// Accepting only trusts the device once it confirms too, see
+    /// [`PairingEvent::Confirmed`].
     Request {
         fingerprint: String,
         request: PairRequest,
         /// shown to the user, who compares it with the other device's
         code: String,
         reply: oneshot::Sender<PairReply>,
+    },
+    /// After this device accepted a [`PairingEvent::Request`], the other
+    /// device's user confirmed (or rejected) the code as well.
+    Confirmed {
+        fingerprint: String,
+        request: PairRequest,
+        confirmed: bool,
     },
     /// The code of a pairing started with [`Control::pair`], known once
     /// both sides exchanged their contributions; the other device shows the
@@ -171,6 +195,7 @@ impl Control {
         let own_fingerprint = crypto::certificate_fingerprint(cert);
         let handler = Handler {
             own_fingerprint: own_fingerprint.clone(),
+            exchanges: Default::default(),
             authorized_keys: authorized_keys.clone(),
             clipboard_enabled,
             peer_clipboard: peer_clipboard.clone(),
@@ -268,20 +293,26 @@ impl Control {
     }
 
     /// Ask the device at `addr`, whose certificate must match `fingerprint`,
-    /// to pair; it will sit at `pos` relative to this one. The outcome arrives
-    /// as [`PairingEvent::Finished`].
+    /// to pair; it will sit at `pos` relative to this one.
+    ///
+    /// Once the code is known ([`PairingEvent::Code`]) this device's user has
+    /// to confirm it too, through `confirmed`: both users compare the codes,
+    /// and neither device trusts the other before both did. The outcome
+    /// arrives as [`PairingEvent::Finished`]; `Ok` with an accepted reply
+    /// means both confirmed.
     pub(crate) fn pair(
         &self,
         addr: SocketAddr,
         fingerprint: String,
         pos: Position,
         request: PairRequest,
+        confirmed: oneshot::Receiver<bool>,
     ) {
         let connector = self.connector.clone();
         let event_tx = self.event_tx.clone();
         let own_fingerprint = self.own_fingerprint.clone();
         spawn_local(async move {
-            let result = timeout(PAIR_TIMEOUT + TIMEOUT, async {
+            let result = async {
                 let (mut tls, presented) = connect(&connector, addr).await?;
                 // The advertised fingerprint is what the user picked; make
                 // sure the device answering really holds that certificate.
@@ -298,9 +329,30 @@ impl Control {
                     fingerprint: fingerprint.clone(),
                     code,
                 });
-                let payload = read_frame(&mut tls, KIND_PAIR_REPLY).await?;
-                Ok(serde_json::from_slice::<PairReply>(&payload)?)
-            })
+                // The other device's user answers within PAIR_TIMEOUT; wait a
+                // little longer, so an answer at the last moment isn't lost.
+                let reply: PairReply = timeout(PAIR_TIMEOUT + TIMEOUT, async {
+                    Ok(serde_json::from_slice(
+                        &read_frame(&mut tls, KIND_PAIR_REPLY).await?,
+                    )?)
+                })
+                .await?;
+                if !reply.accepted {
+                    return Ok(reply);
+                }
+                // our user's side of the comparison (possibly given already)
+                let confirmed = matches!(
+                    tokio::time::timeout(PAIR_TIMEOUT, confirmed).await,
+                    Ok(Ok(true))
+                );
+                write_frame(&mut tls, KIND_PAIR_CONFIRM, &[confirmed as u8]).await?;
+                tls.shutdown().await?;
+                if confirmed {
+                    Ok(reply)
+                } else {
+                    Err(ControlError::Cancelled)
+                }
+            }
             .await;
             let _ = event_tx.send(PairingEvent::Finished {
                 fingerprint,
@@ -315,6 +367,8 @@ impl Control {
 #[derive(Clone)]
 struct Handler {
     own_fingerprint: String,
+    /// when recent pairing code exchanges started, see [`MAX_EXCHANGES`]
+    exchanges: Rc<RefCell<VecDeque<Instant>>>,
     authorized_keys: AuthorizedKeys,
     clipboard_enabled: bool,
     peer_clipboard: PeerClipboards,
@@ -359,6 +413,12 @@ impl Handler {
             }
             KIND_PAIR_REQUEST => {
                 let request: PairRequest = serde_json::from_slice(&payload)?;
+                if let Err(e) = self.count_exchange() {
+                    // tell the requester why, instead of just hanging up
+                    write_frame(tls, KIND_PAIR_BUSY, &[]).await?;
+                    tls.shutdown().await?;
+                    return Err(e);
+                }
                 let code = timeout(
                     TIMEOUT,
                     responder_exchange(tls, &fingerprint, &self.own_fingerprint),
@@ -367,8 +427,8 @@ impl Handler {
                 log::info!("{} ({addr}) asks to pair", request.name);
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let _ = self.event_tx.send(PairingEvent::Request {
-                    fingerprint,
-                    request,
+                    fingerprint: fingerprint.clone(),
+                    request: request.clone(),
                     code,
                     reply: reply_tx,
                 });
@@ -383,11 +443,43 @@ impl Handler {
                     },
                 };
                 write_frame(tls, KIND_PAIR_REPLY, &serde_json::to_vec(&reply)?).await?;
-                tls.shutdown().await?;
+                if !reply.accepted {
+                    tls.shutdown().await?;
+                    return Ok(());
+                }
+                // Our user accepted; trust the other device only once its user
+                // confirmed the code too. It waits PAIR_TIMEOUT for them.
+                let confirmed = timeout(PAIR_TIMEOUT + TIMEOUT, async {
+                    Ok(read_sized_frame(tls, KIND_PAIR_CONFIRM, 1).await?[0] == 1)
+                })
+                .await
+                .unwrap_or(false);
+                let _ = self.event_tx.send(PairingEvent::Confirmed {
+                    fingerprint,
+                    request,
+                    confirmed,
+                });
                 Ok(())
             }
             kind => Err(ControlError::UnexpectedKind(kind)),
         }
+    }
+
+    /// Allow a pairing code exchange if fewer than [`MAX_EXCHANGES`] started
+    /// in the last [`EXCHANGE_WINDOW`].
+    fn count_exchange(&self) -> Result<(), ControlError> {
+        let mut exchanges = self.exchanges.borrow_mut();
+        while exchanges
+            .front()
+            .is_some_and(|t| t.elapsed() >= EXCHANGE_WINDOW)
+        {
+            exchanges.pop_front();
+        }
+        if exchanges.len() >= MAX_EXCHANGES {
+            return Err(ControlError::TooManyAttempts);
+        }
+        exchanges.push_back(Instant::now());
+        Ok(())
     }
 }
 
@@ -540,7 +632,12 @@ async fn requester_exchange<S: AsyncRead + AsyncWrite + Unpin>(
     requester: &str,
     responder: &str,
 ) -> Result<String, ControlError> {
-    let commitment = read_small_frame(stream, KIND_PAIR_COMMIT).await?;
+    let commitment = match read_small_frame(stream, KIND_PAIR_COMMIT).await {
+        Err(ControlError::UnexpectedKind(KIND_PAIR_BUSY)) => {
+            return Err(ControlError::TooManyAttempts);
+        }
+        commitment => commitment?,
+    };
     let nonce_a = random_nonce();
     write_frame(stream, KIND_PAIR_NONCE, &nonce_a).await?;
     let nonce_b = read_small_frame(stream, KIND_PAIR_REVEAL).await?;
@@ -569,20 +666,32 @@ async fn read_small_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     expected: u8,
 ) -> Result<Nonce, ControlError> {
+    let payload = read_sized_frame(stream, expected, NONCE_LEN).await?;
+    Ok(payload.try_into().expect("length checked"))
+}
+
+/// A frame of the given kind and exact length.
+async fn read_sized_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    expected: u8,
+    size: usize,
+) -> Result<Vec<u8>, ControlError> {
     let (kind, len) = read_header(stream).await?;
     if kind != expected {
         return Err(ControlError::UnexpectedKind(kind));
     }
-    if len != NONCE_LEN {
-        return Err(ControlError::TooLarge(len));
+    if len != size {
+        return Err(ControlError::BadLength(len));
     }
-    let payload = read_payload(stream, len).await?;
-    Ok(payload.try_into().expect("length checked"))
+    read_payload(stream, len).await
 }
 
 fn random_nonce() -> Nonce {
     let mut nonce = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce).expect("the system's random number generator failed");
+    ring::default_provider()
+        .secure_random
+        .fill(&mut nonce)
+        .expect("the system's random number generator failed");
     nonce
 }
 
@@ -731,21 +840,34 @@ mod tests {
         }
     }
 
-    /// `a` asks `b` to pair, expecting `b`'s certificate unless `impostor`
-    /// (then `b` is not who `a` meant). `b` answers with `accept`, or drops
-    /// the request if `None`. Returns what `a` learns.
-    async fn pair(impostor: bool, accept: Option<bool>) -> Result<PairReply, ControlError> {
+    /// What a pairing between two devices ended with.
+    struct Outcome {
+        /// what the requesting device learned
+        requester: Result<PairReply, ControlError>,
+        /// whether the responding device was told the requester confirmed
+        /// (`None`: it never got that far)
+        responder_confirmed: Option<bool>,
+    }
+
+    /// `a` asks `b` to pair, expecting `b`'s certificate unless `impostor`.
+    /// `b`'s user answers `accept` (`None`: drops the request), `a`'s user
+    /// confirms the code with `confirm`.
+    async fn pair(impostor: bool, accept: Option<bool>, confirm: bool) -> Outcome {
         let (a_cert, b_cert) = (cert(), cert());
         let mut a = Control::new(0, &a_cert, keys(&[]), false).await.expect("a");
         let mut b = Control::new(0, &b_cert, keys(&[]), false).await.expect("b");
         let b_addr = SocketAddr::new([127, 0, 0, 1].into(), b.port());
         let expected = if impostor { cert() } else { b_cert.clone() };
+        let (confirm_tx, confirm_rx) = oneshot::channel();
         a.pair(
             b_addr,
             crypto::certificate_fingerprint(&expected),
             Position::Right,
             request(),
+            confirm_rx,
         );
+        // a's user may confirm before b's user answers: order doesn't matter
+        let _ = confirm_tx.send(confirm);
 
         let answer = async {
             let PairingEvent::Request {
@@ -780,25 +902,49 @@ mod tests {
             // both screens show the same code
             assert_eq!(answer.await, code);
             event = a.event().await;
+        } else {
+            drop(answer);
         }
         let PairingEvent::Finished { result, pos, .. } = event else {
             panic!("expected the pairing to finish");
         };
         assert_eq!(pos, Position::Right);
-        result
-    }
-
-    async fn pair_with_receiver(accept: Option<bool>) -> Result<PairReply, ControlError> {
-        pair(false, accept).await
+        let responder_confirmed = if !impostor && accept == Some(true) {
+            let PairingEvent::Confirmed { confirmed, .. } = b.event().await else {
+                panic!("expected the confirmation");
+            };
+            Some(confirmed)
+        } else {
+            None
+        };
+        Outcome {
+            requester: result,
+            responder_confirmed,
+        }
     }
 
     #[tokio::test]
-    async fn pairing_is_accepted() {
+    async fn pairing_needs_both_users() {
         LocalSet::new()
             .run_until(async {
-                let reply = pair_with_receiver(Some(true)).await.expect("reply");
+                let outcome = pair(false, Some(true), true).await;
+                let reply = outcome.requester.expect("reply");
                 assert!(reply.accepted);
                 assert_eq!(reply.hostname, "receiver.local");
+                assert_eq!(outcome.responder_confirmed, Some(true));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_requester_can_reject_the_code() {
+        LocalSet::new()
+            .run_until(async {
+                // b's user accepted, but a's user says the codes differ:
+                // neither side may trust the other
+                let outcome = pair(false, Some(true), false).await;
+                assert!(matches!(outcome.requester, Err(ControlError::Cancelled)));
+                assert_eq!(outcome.responder_confirmed, Some(false));
             })
             .await;
     }
@@ -807,14 +953,11 @@ mod tests {
     async fn pairing_is_declined() {
         LocalSet::new()
             .run_until(async {
-                assert!(
-                    !pair_with_receiver(Some(false))
-                        .await
-                        .expect("reply")
-                        .accepted
-                );
+                let outcome = pair(false, Some(false), true).await;
+                assert!(!outcome.requester.expect("reply").accepted);
                 // dropping the request without an answer declines too
-                assert!(!pair_with_receiver(None).await.expect("reply").accepted);
+                let outcome = pair(false, None, true).await;
+                assert!(!outcome.requester.expect("reply").accepted);
             })
             .await;
     }
@@ -823,8 +966,8 @@ mod tests {
     async fn pairing_refuses_an_impostor() {
         LocalSet::new()
             .run_until(async {
-                let result = pair(true, Some(true)).await;
-                assert!(matches!(result, Err(ControlError::WrongPeer(_))));
+                let outcome = pair(true, Some(true), true).await;
+                assert!(matches!(outcome.requester, Err(ControlError::WrongPeer(_))));
             })
             .await;
     }
@@ -836,6 +979,7 @@ mod tests {
                 let (event_tx, _event_rx) = channel();
                 let handler = Handler {
                     own_fingerprint: "me".to_owned(),
+                    exchanges: Default::default(),
                     authorized_keys: keys(&[]),
                     clipboard_enabled: true,
                     peer_clipboard: Default::default(),
@@ -861,6 +1005,7 @@ mod tests {
                 let (event_tx, _event_rx) = channel();
                 let handler = Handler {
                     own_fingerprint: "me".to_owned(),
+                    exchanges: Default::default(),
                     authorized_keys: keys(&[]),
                     clipboard_enabled: true,
                     peer_clipboard: Default::default(),
@@ -910,6 +1055,27 @@ mod tests {
         };
         let (result, _) = tokio::join!(requester_exchange(&mut requester, "aa", "bb"), cheat);
         assert!(matches!(result, Err(ControlError::CommitMismatch)));
+    }
+
+    #[test]
+    fn pairing_exchanges_are_rate_limited() {
+        let (event_tx, _event_rx) = channel();
+        let handler = Handler {
+            own_fingerprint: "me".to_owned(),
+            exchanges: Default::default(),
+            authorized_keys: keys(&[]),
+            clipboard_enabled: false,
+            peer_clipboard: Default::default(),
+            event_tx,
+        };
+        for _ in 0..MAX_EXCHANGES {
+            handler.count_exchange().expect("within the limit");
+        }
+        // someone retrying for a matching code is stopped
+        assert!(matches!(
+            handler.count_exchange(),
+            Err(ControlError::TooManyAttempts)
+        ));
     }
 
     #[test]

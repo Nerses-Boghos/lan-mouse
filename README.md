@@ -338,9 +338,14 @@ lan-mouse cli discover                 # devices on the network
 lan-mouse cli pair macbook left        # pair, placing "macbook" on your left
 ```
 
-The other device asks for confirmation and shows the same six-digit code (in the GTK app a dialog pops up;
-from the command line, answer with `lan-mouse cli pair-accept <fingerprint>` or `pair-decline`).
-Once confirmed, both devices trust each other and are set up at opposite edges.
+Both devices show the same six-digit code, and both users confirm it matches: on the other device a
+dialog pops up (from the command line: `lan-mouse cli pair-accept <fingerprint>` or `pair-decline`), and
+`pair` asks here (or `lan-mouse cli pair-confirm <fingerprint>` / `pair-cancel`). Only when both confirmed
+do the devices trust each other; they are then set up at opposite edges.
+
+The code comes from both devices' certificates and a commit-then-reveal exchange of random numbers, as
+in Bluetooth's numeric comparison: a device in the middle gets a single one-in-a-million guess, and at
+most three exchanges per minute are accepted, so it can't retry for a match.
 `lan-mouse cli watch` prints all service events, including pairing requests, as JSON lines for scripting.
 The name other devices see defaults to the host name and can be set with `name = "..."` in the config file.
 
