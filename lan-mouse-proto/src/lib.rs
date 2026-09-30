@@ -76,7 +76,15 @@ pub enum ProtoEvent {
     /// [`ProtoEvent::Enter`]. `along` runs from 0 (top / left end of the edge)
     /// to [`u16::MAX`] (bottom / right end). Peers that don't know this event
     /// skip it and keep their cursor where it was.
-    CursorPosition { pos: Position, along: u16 },
+    ///
+    /// `crossing` numbers the sender's crossings (wrapping): the receiver
+    /// tells a new crossing from a late or repeated message about one it
+    /// already placed the cursor for.
+    CursorPosition {
+        pos: Position,
+        along: u16,
+        crossing: u16,
+    },
     /// The sender's desktop size in logical pixels, sent in reply to
     /// [`ProtoEvent::Hello`] so the connecting side can line up screens.
     DesktopSize { width: u32, height: u32 },
@@ -101,8 +109,12 @@ impl Display for ProtoEvent {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
                 write!(f, "Hello({s})")
             }
-            ProtoEvent::CursorPosition { pos, along } => {
-                write!(f, "CursorPosition({pos}, {along})")
+            ProtoEvent::CursorPosition {
+                pos,
+                along,
+                crossing,
+            } => {
+                write!(f, "CursorPosition({pos}, {along}, #{crossing})")
             }
             ProtoEvent::DesktopSize { width, height } => write!(f, "DesktopSize({width}x{height})"),
         }
@@ -215,6 +227,7 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             EventType::CursorPosition => Ok(Self::CursorPosition {
                 pos: decode_u8(&mut buf)?.try_into()?,
                 along: decode_u16(&mut buf)?,
+                crossing: decode_u16(&mut buf)?,
             }),
             EventType::DesktopSize => Ok(Self::DesktopSize {
                 width: decode_u32(&mut buf)?,
@@ -289,9 +302,14 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         encode_u8(buf, len, *b);
                     }
                 }
-                ProtoEvent::CursorPosition { pos, along } => {
+                ProtoEvent::CursorPosition {
+                    pos,
+                    along,
+                    crossing,
+                } => {
                     encode_u8(buf, len, pos as u8);
                     encode_u16(buf, len, along);
+                    encode_u16(buf, len, crossing);
                 }
                 ProtoEvent::DesktopSize { width, height } => {
                     encode_u32(buf, len, width);
@@ -367,13 +385,15 @@ mod tests {
         let (buf, len) = ProtoEvent::CursorPosition {
             pos: Position::Right,
             along: 12345,
+            crossing: 7,
         }
         .into();
-        assert_eq!(len, 4);
+        assert_eq!(len, 6);
         match ProtoEvent::try_from(buf) {
             Ok(ProtoEvent::CursorPosition {
                 pos: Position::Right,
                 along: 12345,
+                crossing: 7,
             }) => {}
             other => panic!("unexpected decode: {other:?}"),
         }

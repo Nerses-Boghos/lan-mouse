@@ -7,7 +7,7 @@ use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -177,7 +177,6 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Leave(_) => {
-                                placing.left(addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
@@ -185,7 +184,7 @@ impl ListenTask {
                                 placing.moved(addr);
                                 self.emulation_proxy.consume(event, addr)
                             }
-                            ProtoEvent::CursorPosition { pos, along } if placing.may_place(addr) => {
+                            ProtoEvent::CursorPosition { pos, along, crossing } if placing.place(addr, crossing) => {
                                 let (x, y) = match desktop.displays() {
                                     Some(displays) => entry_on_displays(displays, pos, along),
                                     None => entry_point(pos, along),
@@ -256,7 +255,7 @@ impl ListenTask {
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > PEER_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
-                            placing.left(addr);
+                            placing.forget(addr);
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                             false
@@ -482,32 +481,50 @@ impl EmulationTask {
 /// trigger the barrier again and bounce the cursor between devices.
 const ENTRY_INSET: f64 = 0.01;
 
-/// Which peers may still place the cursor. A peer entering this device sends
-/// its entry point ([`ProtoEvent::CursorPosition`]) next to `Enter`, over UDP,
-/// so it can arrive late, after the user already moved, and must not yank
-/// the cursor back then. Arrival order proves nothing (`Enter` and the
-/// position are repeated until acknowledged, and datagrams get reordered),
-/// so track the peer's visit instead: it may place the cursor from leaving
-/// (or connecting) until its first input on the next visit.
+/// Which peers may place the cursor. A peer entering this device sends its
+/// entry point ([`ProtoEvent::CursorPosition`]) next to `Enter`, over UDP, so
+/// it can arrive late, after the user already moved, and must not yank the
+/// cursor back then. The position is repeated with every repeated `Enter`,
+/// and datagrams get reordered, so arrival order proves nothing: each
+/// crossing is numbered instead. A newer crossing always places the cursor
+/// (the user crossed again, e.g. while sliding along the edge); a crossing
+/// already placed for only until the user moves.
 #[derive(Default)]
 struct Placing {
-    /// peers that sent input since they last left
-    moving: HashSet<SocketAddr>,
+    /// per peer: the crossing last placed for, and whether input followed
+    peers: HashMap<SocketAddr, (u16, bool)>,
 }
 
 impl Placing {
     /// input from `peer`: its visit is under way
     fn moved(&mut self, peer: SocketAddr) {
-        self.moving.insert(peer);
+        if let Some((_, moved)) = self.peers.get_mut(&peer) {
+            *moved = true;
+        }
     }
 
-    /// `peer` left (or went away): its next visit may place the cursor
-    fn left(&mut self, peer: SocketAddr) {
-        self.moving.remove(&peer);
+    /// `peer` went away: forget its crossings (it may restart counting)
+    fn forget(&mut self, peer: SocketAddr) {
+        self.peers.remove(&peer);
     }
 
-    fn may_place(&self, peer: SocketAddr) -> bool {
-        !self.moving.contains(&peer)
+    /// Whether `peer` may place the cursor for its `crossing`; if so, that
+    /// crossing counts as placed.
+    fn place(&mut self, peer: SocketAddr, crossing: u16) -> bool {
+        let allowed = match self.peers.get(&peer) {
+            None => true,
+            // newer, with wrapping: within half the number range ahead
+            Some(&(last, _)) if (crossing.wrapping_sub(last) as i16) > 0 => true,
+            Some(&(last, moved)) => crossing == last && !moved,
+        };
+        if allowed {
+            let moved = self
+                .peers
+                .get(&peer)
+                .is_some_and(|&(last, moved)| last == crossing && moved);
+            self.peers.insert(peer, (crossing, moved));
+        }
+        allowed
     }
 }
 
@@ -677,18 +694,30 @@ mod tests {
             "10.0.0.2:4242".parse().unwrap(),
         );
         let mut placing = Placing::default();
-        // first visit, even if the position arrives before Enter
-        assert!(placing.may_place(a));
+        // first crossing, even if the position arrives before Enter
+        assert!(placing.place(a, 1));
+        assert!(placing.place(a, 1), "repeated before moving: still fine");
         placing.moved(a);
         assert!(
-            !placing.may_place(a),
+            !placing.place(a, 1),
             "a late position must not move the cursor"
         );
-        // a late, repeated Enter doesn't change that: Enter isn't tracked at all
-        assert!(!placing.may_place(a));
-        assert!(placing.may_place(b), "per peer");
-        placing.left(a);
-        assert!(placing.may_place(a), "the next visit may place it again");
+        assert!(!placing.place(a, 0), "nor one of an earlier crossing");
+        assert!(placing.place(b, 1), "per peer");
+        // crossing again (e.g. sliding along the edge): placed again, even
+        // though the previous visit had movement and no Leave came
+        assert!(placing.place(a, 2));
+        placing.moved(a);
+        assert!(!placing.place(a, 2));
+        // counters wrap
+        // far "ahead" is really far behind: a stale one
+        assert!(!placing.place(a, 2u16.wrapping_add(40000)));
+        let mut wrapping = Placing::default();
+        assert!(wrapping.place(a, u16::MAX));
+        assert!(wrapping.place(a, 0), "0 follows u16::MAX");
+        // a peer that went away starts afresh
+        placing.forget(a);
+        assert!(placing.place(a, 1));
     }
 
     #[test]

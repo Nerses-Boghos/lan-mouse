@@ -89,6 +89,7 @@ impl Capture {
             last_send_failure: Default::default(),
             desktop: Default::default(),
             entry_along: None,
+            crossing: 0,
             event_tx,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
@@ -183,6 +184,8 @@ struct CaptureTask {
     last_send_failure: HashMap<CaptureHandle, Instant>,
     /// where the cursor crossed into the active client, re-sent with every `Enter`
     entry_along: Option<u16>,
+    /// numbers crossings, see [`ProtoEvent::CursorPosition`]
+    crossing: u16,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
@@ -371,6 +374,7 @@ impl CaptureTask {
         }
 
         if let CaptureEvent::Begin { along } = event {
+            self.crossing = self.crossing.wrapping_add(1);
             self.entry_along = if self.get_type(handle) == CaptureType::Default {
                 match self.map_crossing(handle, along) {
                     Some(along) => along,
@@ -421,7 +425,14 @@ impl CaptureTask {
         if let (ProtoEvent::Enter(pos), Some(along), Ok(())) = (event, self.entry_along, &result) {
             result = self
                 .conn
-                .send(ProtoEvent::CursorPosition { pos, along }, handle)
+                .send(
+                    ProtoEvent::CursorPosition {
+                        pos,
+                        along,
+                        crossing: self.crossing,
+                    },
+                    handle,
+                )
                 .await;
         }
 
