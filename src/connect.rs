@@ -35,6 +35,8 @@ pub(crate) enum LanMouseConnectionError {
     Webrtc(#[from] webrtc_util::Error),
     #[error("not connected")]
     NotConnected,
+    #[error("the other device refused the connection: it doesn't trust this one")]
+    Refused,
     #[error("emulation is disabled on the target device")]
     TargetEmulationDisabled,
     #[error("Connection timed out")]
@@ -79,12 +81,20 @@ async fn connect_any(
     for &addr in addrs {
         joinset.spawn_local(connect(addr, cert.clone()));
     }
+    // the device answered, but ended the handshake: it doesn't accept our
+    // certificate (it forgot or never paired with this one)
+    let mut refused = false;
     loop {
         match joinset.join_next().await {
+            None if refused => return Err(LanMouseConnectionError::Refused),
             None => return Err(LanMouseConnectionError::NotConnected),
             Some(r) => match r.expect("join error") {
                 Ok(conn) => return Ok(conn),
                 Err((a, e)) => {
+                    refused |= matches!(
+                        e,
+                        LanMouseConnectionError::Dtls(webrtc_dtls::Error::ErrAlertFatalOrClose)
+                    );
                     log::warn!("failed to connect to {a}: `{e}`")
                 }
             },
@@ -190,6 +200,7 @@ async fn connect_to_handle(
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
         let res = connect_any(&addrs, cert).await;
+        client_manager.set_refused(handle, matches!(res, Err(LanMouseConnectionError::Refused)));
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {

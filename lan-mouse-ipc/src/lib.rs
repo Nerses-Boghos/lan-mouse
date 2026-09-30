@@ -220,6 +220,10 @@ pub struct ClientState {
     /// them (for drawing the arrangement)
     #[serde(default)]
     pub peer_monitors: Vec<Monitor>,
+    /// the last connection attempt was refused: the client doesn't trust
+    /// this device (anymore) and has to pair again
+    #[serde(default)]
+    pub refused: bool,
 }
 
 /// A monitor's area in its device's logical pixels.

@@ -367,6 +367,13 @@ impl ClientManager {
         self.mark_connection_changed(handle, changed);
     }
 
+    pub(crate) fn set_refused(&self, handle: ClientHandle, refused: bool) {
+        let changed = self.update_state(handle, |s| {
+            std::mem::replace(&mut s.refused, refused) != refused
+        });
+        self.mark_connection_changed(handle, changed);
+    }
+
     pub(crate) fn set_peer_commit(&self, handle: ClientHandle, commit: Option<[u8; 8]>) {
         let changed = self.update_state(handle, |s| {
             std::mem::replace(&mut s.peer_commit, commit) != commit
