@@ -815,23 +815,29 @@ impl Service {
         };
         self.client_manager
             .set_peer_monitors(handle, layout.monitors.clone());
-        let ours = self
-            .client_manager
-            .get_state(handle)
-            .and_then(|(c, _)| c.arranged_at)
-            .unwrap_or(0);
-        if layout.arranged_at > ours {
-            log::info!(
-                "the other device rearranged the screens: it is {}, offset {:?}",
-                layout.pos,
-                layout.offset
-            );
-            self.update_pos(handle, layout.pos);
-            self.client_manager
-                .set_offset(handle, layout.offset, layout.arranged_at);
-            self.save_config();
-        } else if layout.arranged_at < ours {
-            self.send_layout(handle);
+        let Some((config, _)) = self.client_manager.get_state(handle) else {
+            return;
+        };
+        let same = layout.pos == config.pos && layout.offset == config.offset;
+        match arrangement_decision(
+            config.arranged_at.unwrap_or(0),
+            layout.arranged_at,
+            same,
+            fingerprint > self.public_key_fingerprint.as_str(),
+        ) {
+            ArrangementDecision::Take => {
+                log::info!(
+                    "the other device rearranged the screens: it is {}, offset {:?}",
+                    layout.pos,
+                    layout.offset
+                );
+                self.update_pos(handle, layout.pos);
+                self.client_manager
+                    .set_offset(handle, layout.offset, layout.arranged_at);
+                self.save_config();
+            }
+            ArrangementDecision::Keep => {}
+            ArrangementDecision::Send => self.send_layout(handle),
         }
         self.broadcast_client(handle);
     }
@@ -1249,4 +1255,50 @@ fn local_monitors() -> Vec<Monitor> {
             height: d.height,
         })
         .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ArrangementDecision {
+    /// take the other device's arrangement
+    Take,
+    /// both have the same one already
+    Keep,
+    /// ours is the one to keep: send it
+    Send,
+}
+
+/// Which of two arrangements of the same pair of devices wins: the newer
+/// one; between equally old but different ones (e.g. both from before
+/// arrangements were shared), the one of the device with the greater
+/// fingerprint, so both devices decide the same way.
+fn arrangement_decision(
+    ours_at: u64,
+    theirs_at: u64,
+    same: bool,
+    their_fingerprint_is_greater: bool,
+) -> ArrangementDecision {
+    if same {
+        ArrangementDecision::Keep
+    } else if theirs_at > ours_at || (theirs_at == ours_at && their_fingerprint_is_greater) {
+        ArrangementDecision::Take
+    } else {
+        ArrangementDecision::Send
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_newer_arrangement_wins_on_both_sides() {
+        use ArrangementDecision::*;
+        // a arranged at 5, b at 3: a sends, b takes
+        assert_eq!(arrangement_decision(5, 3, false, false), Send);
+        assert_eq!(arrangement_decision(3, 5, false, true), Take);
+        // equally old: exactly one of the two takes the other's
+        assert_eq!(arrangement_decision(0, 0, false, true), Take);
+        assert_eq!(arrangement_decision(0, 0, false, false), Send);
+        assert_eq!(arrangement_decision(0, 7, true, false), Keep);
+    }
 }
