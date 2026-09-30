@@ -303,6 +303,14 @@ impl Service {
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::Discover => self.broadcast_discovered(),
+            FrontendRequest::SetClipboard(enabled) => {
+                if let Some(control) = &self.control {
+                    control.set_clipboard(enabled);
+                }
+                self.config.set_clipboard(enabled);
+                self.save_config();
+                self.notify_frontend(FrontendEvent::ClipboardStatus(enabled));
+            }
             FrontendRequest::Pair { fingerprint, pos } => self.start_pairing(fingerprint, pos),
             FrontendRequest::PairResponse {
                 fingerprint,
@@ -457,6 +465,7 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
+                self.notify_frontend(FrontendEvent::Controlling(Some(handle)));
                 self.spawn_hook_command(handle, HookKind::Enter);
                 if let (Some(control), Some(addr)) =
                     (&self.control, self.client_manager.active_addr(handle))
@@ -466,6 +475,7 @@ impl Service {
             }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
+                self.notify_frontend(FrontendEvent::Controlling(None));
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
         }
@@ -948,6 +958,7 @@ impl Service {
         ));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_frontend(FrontendEvent::ClipboardStatus(self.config.clipboard()));
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;

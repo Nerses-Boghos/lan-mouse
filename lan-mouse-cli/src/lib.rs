@@ -108,6 +108,11 @@ enum CliSubcommand {
         #[arg(allow_hyphen_values = true)]
         offset: Option<i32>,
     },
+    /// share the clipboard with other devices (on) or not (off)
+    Clipboard {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
     /// re-enable capture
     EnableCapture,
     /// re-enable emulation
@@ -216,6 +221,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 offset,
             })
             .await?
+        }
+        CliSubcommand::Clipboard { state } => {
+            tx.request(FrontendRequest::SetClipboard(state == "on"))
+                .await?
         }
         CliSubcommand::EnableCapture => tx.request(FrontendRequest::EnableCapture).await?,
         CliSubcommand::EnableEmulation => tx.request(FrontendRequest::EnableEmulation).await?,

@@ -276,6 +276,10 @@ pub enum FrontendEvent {
     ConnectionAttempt { fingerprint: String },
     /// Lan Mouse devices currently visible on the local network
     Discovered(Vec<DiscoveredPeer>),
+    /// the keyboard and mouse control this client now (`None`: this device)
+    Controlling(Option<ClientHandle>),
+    /// whether the clipboard follows the cursor to other devices
+    ClipboardStatus(bool),
     /// a device asks to pair; answer with [`FrontendRequest::PairResponse`].
     /// `pos` is where the requesting device will be relative to this one.
     PairRequest {
@@ -368,6 +372,8 @@ pub enum FrontendRequest {
     },
     /// request the list of discovered devices
     Discover,
+    /// share the clipboard with other devices, or stop
+    SetClipboard(bool),
     /// pair with a discovered device that will sit at `pos` relative to this one
     Pair { fingerprint: String, pos: Position },
     /// accept or decline a [`FrontendEvent::PairRequest`]

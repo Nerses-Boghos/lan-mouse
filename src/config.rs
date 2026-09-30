@@ -527,6 +527,12 @@ impl Config {
             .unwrap_or(true)
     }
 
+    pub fn set_clipboard(&mut self, enabled: bool) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .clipboard = Some(enabled);
+    }
+
     /// release bind for returning control to the host
     pub fn release_bind(&self) -> Vec<scancode::Linux> {
         self.config_toml

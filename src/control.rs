@@ -12,7 +12,7 @@
 //! `kind: u8`, `len: u32` (big endian), `payload`.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     future::Future,
     io,
@@ -182,6 +182,8 @@ pub(crate) enum ControlEvent {
 }
 
 type AuthorizedKeys = Arc<RwLock<HashMap<String, String>>>;
+/// Whether clipboard contents are sent and accepted; the user can switch it.
+type ClipboardSwitch = Rc<Cell<bool>>;
 /// Per peer address: hash of the clipboard content last exchanged, and when.
 type PeerClipboards = Rc<RefCell<HashMap<std::net::IpAddr, ([u8; 32], Instant)>>>;
 
@@ -196,7 +198,7 @@ pub(crate) struct Control {
     accept_task: JoinHandle<()>,
     connector: TlsConnector,
     authorized_keys: AuthorizedKeys,
-    clipboard_enabled: bool,
+    clipboard_enabled: ClipboardSwitch,
     /// hash of the clipboard each peer (by ip) is known to have
     peer_clipboard: PeerClipboards,
     event_tx: Sender<ControlEvent>,
@@ -211,6 +213,7 @@ impl Control {
         authorized_keys: AuthorizedKeys,
         clipboard_enabled: bool,
     ) -> Result<Self, ControlError> {
+        let clipboard_enabled = Rc::new(Cell::new(clipboard_enabled));
         let (acceptor, connector) = tls(cert)?;
         let listener = TcpListener::bind(SocketAddr::new([0, 0, 0, 0].into(), port)).await?;
         let port = listener.local_addr()?.port();
@@ -221,7 +224,7 @@ impl Control {
             own_fingerprint: own_fingerprint.clone(),
             exchanges: Default::default(),
             authorized_keys: authorized_keys.clone(),
-            clipboard_enabled,
+            clipboard_enabled: clipboard_enabled.clone(),
             peer_clipboard: peer_clipboard.clone(),
             event_tx: event_tx.clone(),
         };
@@ -265,6 +268,11 @@ impl Control {
         self.port
     }
 
+    /// Share the clipboard with paired devices, or stop (both directions).
+    pub(crate) fn set_clipboard(&self, enabled: bool) {
+        self.clipboard_enabled.set(enabled);
+    }
+
     pub(crate) async fn event(&mut self) -> ControlEvent {
         self.event_rx.recv().await.expect("channel closed")
     }
@@ -272,7 +280,7 @@ impl Control {
     /// Send the local clipboard to `addr` in the background, unless that peer
     /// already has exactly this content.
     pub(crate) fn send_clipboard(&self, addr: SocketAddr) {
-        if !self.clipboard_enabled {
+        if !self.clipboard_enabled.get() {
             return;
         }
         let connector = self.connector.clone();
@@ -418,7 +426,7 @@ struct Handler {
     /// when recent pairing code exchanges started, see [`MAX_EXCHANGES`]
     exchanges: Rc<RefCell<VecDeque<Instant>>>,
     authorized_keys: AuthorizedKeys,
-    clipboard_enabled: bool,
+    clipboard_enabled: ClipboardSwitch,
     peer_clipboard: PeerClipboards,
     event_tx: Sender<ControlEvent>,
 }
@@ -451,7 +459,7 @@ impl Handler {
         let payload = timeout(TIMEOUT, read_payload(tls, len)).await?;
         match kind {
             KIND_CLIPBOARD => {
-                if !self.clipboard_enabled {
+                if !self.clipboard_enabled.get() {
                     return Ok(());
                 }
                 timeout(TIMEOUT, async { Ok(clipboard::write(&payload).await?) }).await?;
@@ -1040,7 +1048,7 @@ mod tests {
                     own_fingerprint: "me".to_owned(),
                     exchanges: Default::default(),
                     authorized_keys: keys(&[]),
-                    clipboard_enabled: true,
+                    clipboard_enabled: Rc::new(Cell::new(true)),
                     peer_clipboard: Default::default(),
                     event_tx,
                 };
@@ -1066,7 +1074,7 @@ mod tests {
                     own_fingerprint: "me".to_owned(),
                     exchanges: Default::default(),
                     authorized_keys: keys(&[]),
-                    clipboard_enabled: true,
+                    clipboard_enabled: Rc::new(Cell::new(true)),
                     peer_clipboard: Default::default(),
                     event_tx,
                 };
@@ -1123,7 +1131,7 @@ mod tests {
             own_fingerprint: "me".to_owned(),
             exchanges: Default::default(),
             authorized_keys: keys(&[]),
-            clipboard_enabled: false,
+            clipboard_enabled: Rc::new(Cell::new(false)),
             peer_clipboard: Default::default(),
             event_tx,
         };

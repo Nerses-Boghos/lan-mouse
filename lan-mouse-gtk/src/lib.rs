@@ -326,7 +326,9 @@ fn build_ui(app: &Application) {
                         };
                         window.show_toast(&msg);
                     }
-                    FrontendEvent::Discovered(_) => {}
+                    FrontendEvent::Discovered(_)
+                    | FrontendEvent::Controlling(_)
+                    | FrontendEvent::ClipboardStatus(_) => {}
                     FrontendEvent::DeviceConnected {
                         fingerprint: _,
                         addr,
