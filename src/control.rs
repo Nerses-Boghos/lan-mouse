@@ -1,5 +1,6 @@
 //! Control channel between Lan Mouse devices, for everything that doesn't fit
-//! the fixed-size UDP/DTLS input protocol: clipboard contents and pairing.
+//! the fixed-size UDP/DTLS input protocol: clipboard contents, pairing and
+//! the screen arrangement.
 //!
 //! It runs over TCP/TLS on the same port as the input channel. Both sides
 //! present their Lan Mouse certificate. Clipboard transfers only happen
@@ -21,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lan_mouse_ipc::Position;
+use lan_mouse_ipc::{Monitor, Position};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::{
     DigitallySignedStruct, DistinguishedName, SignatureScheme,
@@ -66,6 +67,10 @@ const KIND_PAIR_REVEAL: u8 = 6;
 const KIND_PAIR_CONFIRM: u8 = 7;
 /// Sent instead of a commitment while pairing attempts are rate limited.
 const KIND_PAIR_BUSY: u8 = 8;
+const KIND_LAYOUT: u8 = 9;
+
+/// Largest [`Layout`] accepted: a few monitors are a few hundred bytes.
+const MAX_LAYOUT_SIZE: usize = 64 * 1024;
 
 /// At most this many pairing code exchanges per [`EXCHANGE_WINDOW`], across
 /// all devices. Each exchange gives a fresh random code; unlimited exchanges
@@ -126,10 +131,27 @@ pub(crate) struct PairReply {
     pub(crate) port: u16,
 }
 
-pub(crate) enum PairingEvent {
+/// A device's monitors and its arrangement with the receiving device, sent
+/// whenever either changes: both devices keep the same arrangement, seen from
+/// their own side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Layout {
+    /// the sender's monitors, in its logical pixels
+    pub(crate) monitors: Vec<Monitor>,
+    /// where the sender sits relative to the receiver
+    pub(crate) pos: Position,
+    /// where the sender's screen starts along the receiver's edge, in
+    /// pixels; `None` maps the edges proportionally
+    pub(crate) offset: Option<i32>,
+    /// when this arrangement was made, in milliseconds since the Unix
+    /// epoch: the newer one wins
+    pub(crate) arranged_at: u64,
+}
+
+pub(crate) enum ControlEvent {
     /// A device asks to pair. Answer through `reply`; dropping it declines.
     /// Accepting only trusts the device once it confirms too, see
-    /// [`PairingEvent::Confirmed`].
+    /// [`ControlEvent::Confirmed`].
     Request {
         fingerprint: String,
         request: PairRequest,
@@ -137,7 +159,7 @@ pub(crate) enum PairingEvent {
         code: String,
         reply: oneshot::Sender<PairReply>,
     },
-    /// After this device accepted a [`PairingEvent::Request`], the other
+    /// After this device accepted a [`ControlEvent::Request`], the other
     /// device's user confirmed (or rejected) the code as well.
     Confirmed {
         fingerprint: String,
@@ -148,6 +170,8 @@ pub(crate) enum PairingEvent {
     /// both sides exchanged their contributions; the other device shows the
     /// same code while asking its user.
     Code { fingerprint: String, code: String },
+    /// A paired device sent its monitors and arrangement.
+    Layout { fingerprint: String, layout: Layout },
     /// A pairing started with [`Control::pair`] completed.
     Finished {
         fingerprint: String,
@@ -175,8 +199,8 @@ pub(crate) struct Control {
     clipboard_enabled: bool,
     /// hash of the clipboard each peer (by ip) is known to have
     peer_clipboard: PeerClipboards,
-    event_tx: Sender<PairingEvent>,
-    event_rx: Receiver<PairingEvent>,
+    event_tx: Sender<ControlEvent>,
+    event_rx: Receiver<ControlEvent>,
 }
 
 impl Control {
@@ -241,7 +265,7 @@ impl Control {
         self.port
     }
 
-    pub(crate) async fn event(&mut self) -> PairingEvent {
+    pub(crate) async fn event(&mut self) -> ControlEvent {
         self.event_rx.recv().await.expect("channel closed")
     }
 
@@ -292,13 +316,37 @@ impl Control {
         });
     }
 
+    /// Send `layout` to the paired device at `addr`, whose certificate must
+    /// match `fingerprint`, in the background.
+    pub(crate) fn send_layout(&self, addr: SocketAddr, fingerprint: String, layout: Layout) {
+        let connector = self.connector.clone();
+        let authorized_keys = self.authorized_keys.clone();
+        spawn_local(async move {
+            let transfer = async {
+                let payload = serde_json::to_vec(&layout)?;
+                let (mut tls, peer) = connect(&connector, addr).await?;
+                if peer != fingerprint {
+                    return Err(ControlError::WrongPeer(peer));
+                }
+                check_authorized(&peer, &authorized_keys)?;
+                write_frame(&mut tls, KIND_LAYOUT, &payload).await?;
+                tls.shutdown().await?;
+                Ok::<_, ControlError>(())
+            };
+            match timeout(TIMEOUT, transfer).await {
+                Ok(()) => log::info!("sent the screen arrangement to {addr}"),
+                Err(e) => log::warn!("could not send the screen arrangement to {addr}: {e}"),
+            }
+        });
+    }
+
     /// Ask the device at `addr`, whose certificate must match `fingerprint`,
     /// to pair; it will sit at `pos` relative to this one.
     ///
-    /// Once the code is known ([`PairingEvent::Code`]) this device's user has
+    /// Once the code is known ([`ControlEvent::Code`]) this device's user has
     /// to confirm it too, through `confirmed`: both users compare the codes,
     /// and neither device trusts the other before both did. The outcome
-    /// arrives as [`PairingEvent::Finished`]; `Ok` with an accepted reply
+    /// arrives as [`ControlEvent::Finished`]; `Ok` with an accepted reply
     /// means both confirmed.
     pub(crate) fn pair(
         &self,
@@ -325,7 +373,7 @@ impl Control {
                     requester_exchange(&mut tls, &own_fingerprint, &fingerprint),
                 )
                 .await?;
-                let _ = event_tx.send(PairingEvent::Code {
+                let _ = event_tx.send(ControlEvent::Code {
                     fingerprint: fingerprint.clone(),
                     code,
                 });
@@ -354,7 +402,7 @@ impl Control {
                 }
             }
             .await;
-            let _ = event_tx.send(PairingEvent::Finished {
+            let _ = event_tx.send(ControlEvent::Finished {
                 fingerprint,
                 pos,
                 result,
@@ -372,7 +420,7 @@ struct Handler {
     authorized_keys: AuthorizedKeys,
     clipboard_enabled: bool,
     peer_clipboard: PeerClipboards,
-    event_tx: Sender<PairingEvent>,
+    event_tx: Sender<ControlEvent>,
 }
 
 impl Handler {
@@ -389,8 +437,11 @@ impl Handler {
         // Decide what this peer may send before reading (and allocating) it.
         let paired = check_authorized(&fingerprint, &self.authorized_keys).is_ok();
         match kind {
-            KIND_CLIPBOARD if !paired => return Err(ControlError::Unauthorized(fingerprint)),
-            KIND_CLIPBOARD | KIND_PAIR_REQUEST => {}
+            KIND_CLIPBOARD | KIND_LAYOUT if !paired => {
+                return Err(ControlError::Unauthorized(fingerprint));
+            }
+            KIND_LAYOUT if len > MAX_LAYOUT_SIZE => return Err(ControlError::TooLarge(len)),
+            KIND_CLIPBOARD | KIND_LAYOUT | KIND_PAIR_REQUEST => {}
             kind => return Err(ControlError::UnexpectedKind(kind)),
         }
         let limit = if paired { MAX_SIZE } else { MAX_UNPAIRED_SIZE };
@@ -411,6 +462,14 @@ impl Handler {
                 log::info!("received clipboard ({} bytes) from {addr}", payload.len());
                 Ok(())
             }
+            KIND_LAYOUT => {
+                let layout: Layout = serde_json::from_slice(&payload)?;
+                let _ = self.event_tx.send(ControlEvent::Layout {
+                    fingerprint,
+                    layout,
+                });
+                Ok(())
+            }
             KIND_PAIR_REQUEST => {
                 let request: PairRequest = serde_json::from_slice(&payload)?;
                 if let Err(e) = self.count_exchange() {
@@ -426,7 +485,7 @@ impl Handler {
                 .await?;
                 log::info!("{} ({addr}) asks to pair", request.name);
                 let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = self.event_tx.send(PairingEvent::Request {
+                let _ = self.event_tx.send(ControlEvent::Request {
                     fingerprint: fingerprint.clone(),
                     request: request.clone(),
                     code,
@@ -454,7 +513,7 @@ impl Handler {
                 })
                 .await
                 .unwrap_or(false);
-                let _ = self.event_tx.send(PairingEvent::Confirmed {
+                let _ = self.event_tx.send(ControlEvent::Confirmed {
                     fingerprint,
                     request,
                     confirmed,
@@ -870,7 +929,7 @@ mod tests {
         let _ = confirm_tx.send(confirm);
 
         let answer = async {
-            let PairingEvent::Request {
+            let ControlEvent::Request {
                 fingerprint,
                 request: received,
                 code,
@@ -896,7 +955,7 @@ mod tests {
         };
         let mut event = a.event().await;
         if !impostor {
-            let PairingEvent::Code { code, .. } = event else {
+            let ControlEvent::Code { code, .. } = event else {
                 panic!("expected the pairing code");
             };
             // both screens show the same code
@@ -905,12 +964,12 @@ mod tests {
         } else {
             drop(answer);
         }
-        let PairingEvent::Finished { result, pos, .. } = event else {
+        let ControlEvent::Finished { result, pos, .. } = event else {
             panic!("expected the pairing to finish");
         };
         assert_eq!(pos, Position::Right);
         let responder_confirmed = if !impostor && accept == Some(true) {
-            let PairingEvent::Confirmed { confirmed, .. } = b.event().await else {
+            let ControlEvent::Confirmed { confirmed, .. } = b.event().await else {
                 panic!("expected the confirmation");
             };
             Some(confirmed)

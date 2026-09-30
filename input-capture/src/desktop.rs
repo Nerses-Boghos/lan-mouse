@@ -1,4 +1,5 @@
-//! The size of the local desktop, used to line up screens between devices.
+//! The local monitors and the desktop they span, used to line up screens
+//! between devices.
 
 /// Bounding box of all monitors, in logical pixels (the coordinates the
 /// pointer moves in).
@@ -24,7 +25,7 @@ impl DesktopBounds {
         }
     }
 
-    fn enclosing(monitors: impl IntoIterator<Item = Self>) -> Option<Self> {
+    pub fn enclosing(monitors: impl IntoIterator<Item = Self>) -> Option<Self> {
         monitors
             .into_iter()
             .filter(|m| m.width > 0 && m.height > 0)
@@ -34,7 +35,16 @@ impl DesktopBounds {
 
 /// The current desktop bounds, if the platform can report them.
 pub fn desktop_bounds() -> Option<DesktopBounds> {
-    platform::desktop_bounds()
+    DesktopBounds::enclosing(displays()?)
+}
+
+/// Every monitor's area, if the platform can report them.
+pub fn displays() -> Option<Vec<DesktopBounds>> {
+    let displays: Vec<_> = platform::displays()?
+        .into_iter()
+        .filter(|m| m.width > 0 && m.height > 0)
+        .collect();
+    (!displays.is_empty()).then_some(displays)
 }
 
 #[cfg(target_os = "macos")]
@@ -42,17 +52,22 @@ mod platform {
     use super::DesktopBounds;
     use core_graphics::display::CGDisplay;
 
-    pub(super) fn desktop_bounds() -> Option<DesktopBounds> {
+    pub(super) fn displays() -> Option<Vec<DesktopBounds>> {
         let displays = CGDisplay::active_displays().ok()?;
-        DesktopBounds::enclosing(displays.into_iter().map(|id| {
-            let b = CGDisplay::new(id).bounds();
-            DesktopBounds {
-                x: b.origin.x as i32,
-                y: b.origin.y as i32,
-                width: b.size.width as u32,
-                height: b.size.height as u32,
-            }
-        }))
+        Some(
+            displays
+                .into_iter()
+                .map(|id| {
+                    let b = CGDisplay::new(id).bounds();
+                    DesktopBounds {
+                        x: b.origin.x as i32,
+                        y: b.origin.y as i32,
+                        width: b.size.width as u32,
+                        height: b.size.height as u32,
+                    }
+                })
+                .collect(),
+        )
     }
 }
 
@@ -84,7 +99,7 @@ mod platform {
         outputs: HashMap<u32, Geometry>,
     }
 
-    pub(super) fn desktop_bounds() -> Option<DesktopBounds> {
+    pub(super) fn displays() -> Option<Vec<DesktopBounds>> {
         let conn = Connection::connect_to_env().ok()?;
         let (globals, mut queue) = registry_queue_init::<State>(&conn).ok()?;
         let qh = queue.handle();
@@ -105,15 +120,21 @@ mod platform {
         }
         let mut state = State::default();
         queue.roundtrip(&mut state).ok()?;
-        DesktopBounds::enclosing(state.outputs.values().filter_map(|output| {
-            let ((x, y), (w, h)) = (output.position?, output.size?);
-            Some(DesktopBounds {
-                x,
-                y,
-                width: w.max(0) as u32,
-                height: h.max(0) as u32,
-            })
-        }))
+        Some(
+            state
+                .outputs
+                .values()
+                .filter_map(|output| {
+                    let ((x, y), (w, h)) = (output.position?, output.size?);
+                    Some(DesktopBounds {
+                        x,
+                        y,
+                        width: w.max(0) as u32,
+                        height: h.max(0) as u32,
+                    })
+                })
+                .collect(),
+        )
     }
 
     impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -156,7 +177,7 @@ mod platform {
 mod platform {
     use super::DesktopBounds;
 
-    pub(super) fn desktop_bounds() -> Option<DesktopBounds> {
+    pub(super) fn displays() -> Option<Vec<DesktopBounds>> {
         None
     }
 }

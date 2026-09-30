@@ -12,7 +12,7 @@ use mdns_sd::{IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
 /// Bump when the pairing / control protocol changes incompatibly.
-const PROTOCOL_VERSION: &str = "3";
+const PROTOCOL_VERSION: &str = "4";
 
 pub(crate) struct Discovery {
     daemon: ServiceDaemon,

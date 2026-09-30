@@ -87,6 +87,10 @@ struct TomlClient {
     leave_hook: Option<String>,
     /// where the client's screen starts along the shared edge, in pixels
     offset: Option<i32>,
+    /// the client's certificate fingerprint, once paired
+    fingerprint: Option<String>,
+    /// when the arrangement last changed (ms since the Unix epoch)
+    arranged_at: Option<u64>,
 }
 
 impl ConfigToml {
@@ -284,6 +288,8 @@ pub struct ConfigClient {
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
     pub offset: Option<i32>,
+    pub fingerprint: Option<String>,
+    pub arranged_at: Option<u64>,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -304,6 +310,8 @@ impl From<TomlClient> for ConfigClient {
             enter_hook,
             leave_hook,
             offset: toml.offset,
+            fingerprint: toml.fingerprint,
+            arranged_at: toml.arranged_at,
         }
     }
 }
@@ -334,6 +342,8 @@ impl From<ConfigClient> for TomlClient {
             enter_hook,
             leave_hook,
             offset: client.offset,
+            fingerprint: client.fingerprint,
+            arranged_at: client.arranged_at,
         }
     }
 }

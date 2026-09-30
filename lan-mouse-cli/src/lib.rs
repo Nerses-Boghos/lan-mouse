@@ -99,6 +99,15 @@ enum CliSubcommand {
         #[arg(allow_hyphen_values = true)]
         offset: Option<i32>,
     },
+    /// place a client's screen in one go: the side it is on and, optionally,
+    /// where its edge starts along ours (see set-offset); the other device
+    /// follows
+    Arrange {
+        id: ClientHandle,
+        pos: Position,
+        #[arg(allow_hyphen_values = true)]
+        offset: Option<i32>,
+    },
     /// re-enable capture
     EnableCapture,
     /// re-enable emulation
@@ -199,6 +208,14 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::SetOffset { id, offset } => {
             tx.request(FrontendRequest::UpdateOffset(id, offset))
                 .await?
+        }
+        CliSubcommand::Arrange { id, pos, offset } => {
+            tx.request(FrontendRequest::Arrange {
+                handle: id,
+                pos,
+                offset,
+            })
+            .await?
         }
         CliSubcommand::EnableCapture => tx.request(FrontendRequest::EnableCapture).await?,
         CliSubcommand::EnableEmulation => tx.request(FrontendRequest::EnableEmulation).await?,

@@ -8,7 +8,7 @@ use std::{
 use slab::Slab;
 use tokio::sync::Notify;
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Monitor, Position};
 
 use crate::config::ConfigClient;
 
@@ -50,6 +50,8 @@ impl ClientManager {
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
             offset: config_client.offset,
+            fingerprint: config_client.fingerprint,
+            arranged_at: config_client.arranged_at,
         };
         let state = ClientState {
             active: config_client.active,
@@ -246,11 +248,35 @@ impl ClientManager {
         }
     }
 
-    /// set where the client's screen starts along the shared edge
-    pub(crate) fn set_offset(&self, handle: ClientHandle, offset: Option<i32>) {
+    /// set where the client's screen starts along the shared edge, and
+    /// when this arrangement was made
+    pub(crate) fn set_offset(&self, handle: ClientHandle, offset: Option<i32>, at: u64) {
         if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             c.offset = offset;
+            c.arranged_at = Some(at);
         }
+    }
+
+    pub(crate) fn set_fingerprint(&self, handle: ClientHandle, fingerprint: Option<String>) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.fingerprint = fingerprint;
+        }
+    }
+
+    /// The client paired with the certificate `fingerprint`.
+    pub(crate) fn find_by_fingerprint(&self, fingerprint: &str) -> Option<ClientHandle> {
+        self.clients
+            .borrow()
+            .iter()
+            .find(|(_, (c, _))| c.fingerprint.as_deref() == Some(fingerprint))
+            .map(|(handle, _)| handle as ClientHandle)
+    }
+
+    pub(crate) fn set_peer_monitors(&self, handle: ClientHandle, monitors: Vec<Monitor>) {
+        let changed = self.update_state(handle, |s| {
+            std::mem::replace(&mut s.peer_monitors, monitors.clone()) != monitors
+        });
+        self.mark_connection_changed(handle, changed);
     }
 
     /// Where a client's screen is: what's needed to line up a crossing.

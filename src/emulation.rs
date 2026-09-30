@@ -186,7 +186,10 @@ impl ListenTask {
                                 self.emulation_proxy.consume(event, addr)
                             }
                             ProtoEvent::CursorPosition { pos, along } if placing.may_place(addr) => {
-                                let (x, y) = entry_point(pos, along);
+                                let (x, y) = match desktop.displays() {
+                                    Some(displays) => entry_on_displays(displays, pos, along),
+                                    None => entry_point(pos, along),
+                                };
                                 self.emulation_proxy.warp(x, y, addr);
                             }
                             ProtoEvent::CursorPosition { .. } => {
@@ -508,27 +511,106 @@ impl Placing {
     }
 }
 
-/// This desktop's size for peers, measured at most every few seconds:
-/// peers get it with every crossing, and measuring talks to the compositor.
+/// This desktop's monitors, measured at most every few seconds: peers get
+/// the size with every crossing, and measuring talks to the compositor.
 #[derive(Default)]
-struct DesktopCache(Option<(Instant, input_capture::DesktopBounds)>);
+struct DesktopCache(Option<(Instant, Vec<input_capture::DesktopBounds>)>);
 
 impl DesktopCache {
-    fn size_event(&mut self) -> Option<ProtoEvent> {
+    fn displays(&mut self) -> Option<&[input_capture::DesktopBounds]> {
         const FRESH: Duration = Duration::from_secs(5);
-        let bounds = match self.0 {
-            Some((at, bounds)) if at.elapsed() < FRESH => bounds,
-            _ => {
-                let bounds = input_capture::desktop_bounds()?;
-                self.0 = Some((Instant::now(), bounds));
-                bounds
-            }
-        };
+        if !matches!(&self.0, Some((at, _)) if at.elapsed() < FRESH) {
+            self.0 = Some((Instant::now(), input_capture::displays()?));
+        }
+        self.0.as_ref().map(|(_, displays)| displays.as_slice())
+    }
+
+    fn size_event(&mut self) -> Option<ProtoEvent> {
+        let bounds = input_capture::DesktopBounds::enclosing(self.displays()?.iter().copied())?;
         Some(ProtoEvent::DesktopSize {
             width: bounds.width,
             height: bounds.height,
         })
     }
+}
+
+/// Like [`entry_point`], but on a monitor: `along` is a fraction of the
+/// whole desktop's edge, which may point at a gap between monitors (or past
+/// a smaller one). The cursor enters on the monitor at that edge closest to
+/// the point, just inside it.
+fn entry_on_displays(
+    displays: &[input_capture::DesktopBounds],
+    pos: Position,
+    along: u16,
+) -> (f64, f64) {
+    let Some(desktop) = input_capture::DesktopBounds::enclosing(displays.iter().copied()) else {
+        return entry_point(pos, along);
+    };
+    let t = along as f64 / u16::MAX as f64;
+    let vertical_edge = matches!(pos, Position::Left | Position::Right);
+    // the point along the edge, in desktop coordinates
+    let target = if vertical_edge {
+        desktop.y as f64 + t * desktop.height as f64
+    } else {
+        desktop.x as f64 + t * desktop.width as f64
+    };
+    let right = |d: &input_capture::DesktopBounds| d.x + d.width as i32;
+    let bottom = |d: &input_capture::DesktopBounds| d.y + d.height as i32;
+    let on_edge = |d: &&input_capture::DesktopBounds| match pos {
+        Position::Left => d.x == desktop.x,
+        Position::Right => right(d) == right(&desktop),
+        Position::Top => d.y == desktop.y,
+        Position::Bottom => bottom(d) == bottom(&desktop),
+    };
+    // the monitor's extent along the edge
+    let span = |d: &input_capture::DesktopBounds| {
+        if vertical_edge {
+            (d.y as f64, bottom(d) as f64)
+        } else {
+            (d.x as f64, right(d) as f64)
+        }
+    };
+    let distance = |d: &&input_capture::DesktopBounds| {
+        let (start, end) = span(d);
+        if target < start {
+            start - target
+        } else if target >= end {
+            target - end
+        } else {
+            0.0
+        }
+    };
+    let Some(display) = displays
+        .iter()
+        .filter(on_edge)
+        .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+    else {
+        return entry_point(pos, along);
+    };
+    let (start, end) = span(display);
+    let along_px = target.clamp(start, (end - 1.0).max(start));
+    let (x, y) = match pos {
+        Position::Left => (
+            display.x as f64 + ENTRY_INSET * display.width as f64,
+            along_px,
+        ),
+        Position::Right => (
+            right(display) as f64 - ENTRY_INSET * display.width as f64,
+            along_px,
+        ),
+        Position::Top => (
+            along_px,
+            display.y as f64 + ENTRY_INSET * display.height as f64,
+        ),
+        Position::Bottom => (
+            along_px,
+            bottom(display) as f64 - ENTRY_INSET * display.height as f64,
+        ),
+    };
+    (
+        (x - desktop.x as f64) / desktop.width as f64,
+        (y - desktop.y as f64) / desktop.height as f64,
+    )
 }
 
 /// Desktop fractions `(x, y)` of the point `along` the entry edge `pos`.
@@ -607,6 +689,37 @@ mod tests {
         assert!(placing.may_place(b), "per peer");
         placing.left(a);
         assert!(placing.may_place(a), "the next visit may place it again");
+    }
+
+    #[test]
+    fn entries_land_on_a_monitor() {
+        let mon = |x, y, width, height| input_capture::DesktopBounds {
+            x,
+            y,
+            width,
+            height,
+        };
+        // a laptop (left) next to a taller monitor (right), tops aligned:
+        // the desktop's left edge only has the laptop's 800 pixels
+        let displays = [mon(0, 0, 1280, 800), mon(1280, 0, 2560, 1440)];
+        let (x, y) = entry_on_displays(&displays, Position::Left, u16::MAX);
+        assert!(
+            y * 1440.0 < 800.0,
+            "entered below the laptop: y = {}",
+            y * 1440.0
+        );
+        assert!(x * 3840.0 < 1280.0);
+        // the middle of the right edge is on the monitor, unchanged
+        let (x, y) = entry_on_displays(&displays, Position::Right, u16::MAX / 2);
+        assert!((y - 0.5).abs() < 0.001);
+        assert!(x > 0.98 && x < 1.0);
+        // one monitor: same as without knowing the monitors
+        let one = [mon(0, 0, 1920, 1080)];
+        let (a, b) = (
+            entry_on_displays(&one, Position::Top, 1000),
+            entry_point(Position::Top, 1000),
+        );
+        assert!((a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9);
     }
 
     #[test]

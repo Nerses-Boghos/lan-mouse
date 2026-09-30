@@ -3,7 +3,7 @@ use crate::{
     client::ClientManager,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
-    control::{Control, PairReply, PairRequest, PairingEvent},
+    control::{Control, ControlEvent, Layout, PairReply, PairRequest},
     crypto,
     discovery::{self, Discovery},
     dns::{DnsEvent, DnsResolver},
@@ -13,7 +13,7 @@ use crate::{
 use futures::StreamExt;
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, PairStatus, Position, Status,
+    IpcListenerCreationError, Monitor, PairStatus, Position, Status,
 };
 use log;
 use std::{
@@ -21,6 +21,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
@@ -86,6 +87,10 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// connected clients that have our layout, by the address they got it at
+    layout_sent: HashMap<ClientHandle, SocketAddr>,
+    /// this device's monitors, as last sent to other devices
+    monitors: Vec<Monitor>,
 }
 
 /// Pairing requests waiting for an answer at the same time; more are declined.
@@ -172,6 +177,8 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            layout_sent: Default::default(),
+            monitors: local_monitors(),
         };
         Ok(service)
     }
@@ -189,6 +196,9 @@ impl Service {
             self.activate_client(handle);
         }
 
+        // monitors come and go; other devices draw and map ours
+        let mut monitor_check = tokio::time::interval(Duration::from_secs(10));
+
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
@@ -199,8 +209,10 @@ impl Service {
                 handles = self.client_manager.connection_changed() => {
                     for handle in handles {
                         self.broadcast_client(handle);
+                        self.share_layout_on_connect(handle);
                     }
                 }
+                _ = monitor_check.tick() => self.check_monitors(),
                 event = next_control_event(&mut self.control) => self.handle_control_event(event),
                 _ = discovery_changed(&mut self.discovery) => {
                     self.update_announced_ips();
@@ -264,8 +276,8 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::UpdatePosition(handle, pos) => {
-                self.update_pos(handle, pos);
-                self.save_config();
+                // the old offset was along another edge
+                self.arrange(handle, pos, None)
             }
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
             FrontendRequest::Sync => self.sync_frontend(),
@@ -277,10 +289,15 @@ impl Service {
                 self.update_enter_hook(handle, enter_hook)
             }
             FrontendRequest::UpdateOffset(handle, offset) => {
-                self.client_manager.set_offset(handle, offset);
-                self.broadcast_client(handle);
-                self.save_config();
+                if let Some(pos) = self.client_manager.get_pos(handle) {
+                    self.arrange(handle, pos, offset);
+                }
             }
+            FrontendRequest::Arrange {
+                handle,
+                pos,
+                offset,
+            } => self.arrange(handle, pos, offset),
             FrontendRequest::UpdateLeaveHook(handle, leave_hook) => {
                 self.update_leave_hook(handle, leave_hook)
             }
@@ -311,6 +328,8 @@ impl Service {
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
                 offset: c.offset,
+                fingerprint: c.fingerprint,
+                arranged_at: c.arranged_at,
             })
             .collect();
         self.config.set_clients(clients);
@@ -476,9 +495,9 @@ impl Service {
         self.broadcast_client(handle);
     }
 
-    fn handle_control_event(&mut self, event: PairingEvent) {
+    fn handle_control_event(&mut self, event: ControlEvent) {
         match event {
-            PairingEvent::Request {
+            ControlEvent::Request {
                 fingerprint,
                 request,
                 code,
@@ -514,7 +533,7 @@ impl Service {
                     },
                 );
             }
-            PairingEvent::Confirmed {
+            ControlEvent::Confirmed {
                 fingerprint,
                 request,
                 confirmed,
@@ -537,7 +556,7 @@ impl Service {
                     status,
                 });
             }
-            PairingEvent::Code { fingerprint, code } => {
+            ControlEvent::Code { fingerprint, code } => {
                 let name = display_name(
                     self.discovery
                         .as_ref()
@@ -550,7 +569,11 @@ impl Service {
                     status: PairStatus::Waiting { code },
                 });
             }
-            PairingEvent::Finished {
+            ControlEvent::Layout {
+                fingerprint,
+                layout,
+            } => self.apply_layout(&fingerprint, layout),
+            ControlEvent::Finished {
                 fingerprint,
                 pos,
                 result,
@@ -659,7 +682,7 @@ impl Service {
         };
         log::info!("asking {} to pair", peer.name);
         // the code is known once both sides exchanged their contributions
-        // (PairingEvent::Code); the user then confirms it (confirm_pairing)
+        // (ControlEvent::Code); the user then confirms it (confirm_pairing)
         let (confirm_tx, confirm_rx) = oneshot::channel();
         self.outgoing_pairs.insert(fingerprint.clone(), confirm_tx);
         control.pair(
@@ -707,7 +730,7 @@ impl Service {
             return;
         }
         // Accepting isn't enough: the other device's user confirms the code
-        // too, and only then is it trusted (PairingEvent::Confirmed).
+        // too, and only then is it trusted (ControlEvent::Confirmed).
         let status = if accept {
             PairStatus::Waiting { code }
         } else {
@@ -753,10 +776,160 @@ impl Service {
                 handle
             }
         };
+        self.client_manager
+            .set_fingerprint(handle, Some(fingerprint.to_owned()));
         self.update_pos(handle, pos);
+        self.client_manager.set_offset(handle, None, now_millis());
         self.activate_client(handle);
         self.save_config();
         log::info!("paired with {name} ({hostname}), placed {pos}");
+    }
+
+    /// Place client `handle` at `pos` with `offset` (see
+    /// [`lan_mouse_ipc::ClientConfig::offset`]), and tell the other device,
+    /// which keeps the same arrangement from its side.
+    fn arrange(&mut self, handle: ClientHandle, pos: Position, offset: Option<i32>) {
+        self.update_pos(handle, pos);
+        self.client_manager.set_offset(handle, offset, now_millis());
+        self.broadcast_client(handle);
+        self.save_config();
+        self.send_layout(handle);
+    }
+
+    /// The other device's layout: take its monitors, and its arrangement if
+    /// it is newer than ours. If ours is newer, it gets ours.
+    fn apply_layout(&mut self, fingerprint: &str, layout: Layout) {
+        let Some(handle) = self.client_for_fingerprint(fingerprint) else {
+            log::info!("got a screen arrangement from {fingerprint}, which has no connection here");
+            return;
+        };
+        self.client_manager
+            .set_peer_monitors(handle, layout.monitors.clone());
+        let ours = self
+            .client_manager
+            .get_state(handle)
+            .and_then(|(c, _)| c.arranged_at)
+            .unwrap_or(0);
+        if layout.arranged_at > ours {
+            log::info!(
+                "the other device rearranged the screens: it is {}, offset {:?}",
+                layout.pos,
+                layout.offset
+            );
+            self.update_pos(handle, layout.pos);
+            self.client_manager
+                .set_offset(handle, layout.offset, layout.arranged_at);
+            self.save_config();
+        } else if layout.arranged_at < ours {
+            self.send_layout(handle);
+        }
+        self.broadcast_client(handle);
+    }
+
+    /// Send our monitors and arrangement to the device behind `handle`, if
+    /// it is connected.
+    fn send_layout(&mut self, handle: ClientHandle) {
+        let Some(addr) = self.client_manager.active_addr(handle) else {
+            return;
+        };
+        let Some(fingerprint) = self.client_fingerprint(handle) else {
+            log::debug!("client {handle} isn't paired: can't share the arrangement");
+            return;
+        };
+        let (Some(control), Some((config, _))) =
+            (&self.control, self.client_manager.get_state(handle))
+        else {
+            return;
+        };
+        let layout = Layout {
+            monitors: self.monitors.clone(),
+            pos: config.pos.opposite(),
+            offset: config.offset.map(|o| -o),
+            arranged_at: config.arranged_at.unwrap_or(0),
+        };
+        control.send_layout(addr, fingerprint, layout);
+        self.layout_sent.insert(handle, addr);
+    }
+
+    /// A client that just connected (at a new address) gets our layout.
+    fn share_layout_on_connect(&mut self, handle: ClientHandle) {
+        let connected = self
+            .client_manager
+            .get_state(handle)
+            .filter(|(_, s)| s.alive)
+            .and_then(|(_, s)| s.active_addr);
+        match connected {
+            Some(addr) if self.layout_sent.get(&handle) != Some(&addr) => self.send_layout(handle),
+            Some(_) => {}
+            None => {
+                self.layout_sent.remove(&handle);
+            }
+        }
+    }
+
+    /// Tell connected devices when our monitors changed.
+    fn check_monitors(&mut self) {
+        if self.layout_sent.is_empty() {
+            return;
+        }
+        let monitors = local_monitors();
+        if monitors.is_empty() || monitors == self.monitors {
+            return;
+        }
+        log::info!("the monitors changed");
+        self.monitors = monitors;
+        let handles: Vec<_> = self.layout_sent.keys().copied().collect();
+        for handle in handles {
+            self.send_layout(handle);
+        }
+    }
+
+    /// The certificate fingerprint of the device behind client `handle`:
+    /// recorded when pairing, or found through discovery for clients set up
+    /// before that (and recorded then).
+    fn client_fingerprint(&mut self, handle: ClientHandle) -> Option<String> {
+        let (config, _) = self.client_manager.get_state(handle)?;
+        if config.fingerprint.is_some() {
+            return config.fingerprint;
+        }
+        let hostname = config.hostname?;
+        let fingerprint = self
+            .discovery
+            .as_ref()?
+            .peers(|_| false)
+            .into_iter()
+            .find(|p| p.port == config.port && same_host(&p.hostname, &hostname))?
+            .fingerprint;
+        if !self
+            .authorized_keys
+            .read()
+            .expect("lock")
+            .contains_key(&fingerprint)
+        {
+            return None;
+        }
+        self.client_manager
+            .set_fingerprint(handle, Some(fingerprint.clone()));
+        self.save_config();
+        Some(fingerprint)
+    }
+
+    /// The client for the paired device with `fingerprint`.
+    fn client_for_fingerprint(&mut self, fingerprint: &str) -> Option<ClientHandle> {
+        if let Some(handle) = self.client_manager.find_by_fingerprint(fingerprint) {
+            return Some(handle);
+        }
+        // a client set up before fingerprints were recorded
+        let handles: Vec<_> = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .filter(|(_, c, _)| c.fingerprint.is_none())
+            .map(|(handle, _, _)| handle)
+            .collect();
+        handles
+            .into_iter()
+            .find(|&handle| self.client_fingerprint(handle).as_deref() == Some(fingerprint))
     }
 
     fn resolve(&self, handle: ClientHandle) {
@@ -1021,7 +1194,7 @@ impl std::fmt::Display for HookKind {
     }
 }
 
-async fn next_control_event(control: &mut Option<Control>) -> PairingEvent {
+async fn next_control_event(control: &mut Option<Control>) -> ControlEvent {
     match control {
         Some(control) => control.event().await,
         None => std::future::pending().await,
@@ -1044,4 +1217,25 @@ fn display_name(peer: Option<&lan_mouse_ipc::DiscoveredPeer>) -> String {
 fn same_host(a: &str, b: &str) -> bool {
     a.trim_end_matches('.')
         .eq_ignore_ascii_case(b.trim_end_matches('.'))
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// This device's monitors, in logical pixels.
+fn local_monitors() -> Vec<Monitor> {
+    input_capture::displays()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| Monitor {
+            x: d.x,
+            y: d.y,
+            width: d.width,
+            height: d.height,
+        })
+        .collect()
 }

@@ -158,6 +158,15 @@ pub struct ClientConfig {
     /// for a client on the left). `None` maps the edges proportionally.
     #[serde(default)]
     pub offset: Option<i32>,
+    /// The client's certificate fingerprint, once paired: identifies it on
+    /// the control channel (host names and addresses change).
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    /// When `pos` and `offset` were last changed (milliseconds since the
+    /// Unix epoch), on either device: the newer arrangement wins when the
+    /// two devices exchange theirs.
+    #[serde(default)]
+    pub arranged_at: Option<u64>,
 }
 
 impl Default for ClientConfig {
@@ -170,6 +179,8 @@ impl Default for ClientConfig {
             cmd: None,
             leave_cmd: None,
             offset: None,
+            fingerprint: None,
+            arranged_at: None,
         }
     }
 }
@@ -205,6 +216,19 @@ pub struct ClientState {
     /// the client's desktop size in logical pixels, as it reported it
     #[serde(default)]
     pub peer_size: Option<(u32, u32)>,
+    /// the client's monitors in its own logical coordinates, as it reported
+    /// them (for drawing the arrangement)
+    #[serde(default)]
+    pub peer_monitors: Vec<Monitor>,
+}
+
+/// A monitor's area in its device's logical pixels.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Monitor {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +355,13 @@ pub enum FrontendRequest {
     /// set where the client's screen starts along the shared edge, see
     /// [`ClientConfig::offset`]
     UpdateOffset(ClientHandle, Option<i32>),
+    /// place the client at `pos`, its screen starting `offset` along the
+    /// shared edge (see [`ClientConfig::offset`]); both devices follow
+    Arrange {
+        handle: ClientHandle,
+        pos: Position,
+        offset: Option<i32>,
+    },
     /// request the list of discovered devices
     Discover,
     /// pair with a discovered device that will sit at `pos` relative to this one
