@@ -9,7 +9,7 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -90,6 +90,7 @@ impl Capture {
             desktop: Default::default(),
             entry_along: None,
             crossing: 0,
+            pushing: None,
             event_tx,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
@@ -186,6 +187,8 @@ struct CaptureTask {
     entry_along: Option<u16>,
     /// numbers crossings, see [`ProtoEvent::CursorPosition`]
     crossing: u16,
+    /// the pointer reached an edge and must push on to cross, see [`Push`]
+    pushing: Option<Push>,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
@@ -358,8 +361,26 @@ impl CaptureTask {
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
+            self.pushing = None;
             return self.release_capture(capture).await;
         }
+
+        // Reaching the edge doesn't cross yet: the pointer has to push on,
+        // so brushing the edge while moving along it stays on this screen.
+        let event = if self.get_type(handle) == CaptureType::Default
+            && self.active_client != Some(handle)
+        {
+            match self.push(handle, event) {
+                PushOutcome::Cross(event) => event,
+                PushOutcome::Wait => return Ok(()),
+                PushOutcome::StayHere(slide) => {
+                    log::debug!("not crossing: the pointer didn't push through the edge");
+                    return capture.release_sliding(slide).await;
+                }
+            }
+        } else {
+            event
+        };
 
         // While a client is unreachable, the cursor stays pressed against the
         // edge and re-triggers capture continuously. Don't retry (and fire the
@@ -497,6 +518,34 @@ impl CaptureTask {
         Some(bounds)
     }
 
+    /// Decide what reaching the edge to client `handle` leads to, see [`Push`].
+    fn push(&mut self, handle: CaptureHandle, event: CaptureEvent) -> PushOutcome {
+        let pos = self.get_pos(handle);
+        match (event, self.pushing.as_mut()) {
+            (CaptureEvent::Begin { along }, _) => {
+                self.pushing = Some(Push::new(handle, pos, along));
+                PushOutcome::Wait
+            }
+            (CaptureEvent::Input(input), Some(push)) if push.handle == handle => {
+                match push.update(&input) {
+                    PushState::Through => {
+                        let along = push.along;
+                        self.pushing = None;
+                        PushOutcome::Cross(CaptureEvent::Begin { along })
+                    }
+                    PushState::Pushing => PushOutcome::Wait,
+                    PushState::Gave => {
+                        let slide = push.slid;
+                        self.pushing = None;
+                        PushOutcome::StayHere(slide)
+                    }
+                }
+            }
+            // input while captured for another reason: nothing to cross into
+            (CaptureEvent::Input(_), _) => PushOutcome::StayHere(0.0),
+        }
+    }
+
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
@@ -553,6 +602,81 @@ impl CaptureTask {
 
 thread_local! {
     static PREV_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// How far the pointer has to keep moving into an edge to cross it, in
+/// pointer motion units (about pixels).
+const PUSH_DISTANCE: f64 = 30.0;
+/// Pushing must make progress: past this, a pause or a slow drift stays.
+const PUSH_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// The pointer reached the edge to another device. It crosses once it has
+/// pushed [`PUSH_DISTANCE`] further into the edge; moving back, sliding
+/// along the edge more than into it, or stalling keeps it on this screen,
+/// where it slid to.
+struct Push {
+    handle: CaptureHandle,
+    pos: input_capture::Position,
+    /// where along the edge it arrived, see [`CaptureEvent::Begin`]
+    along: Option<u16>,
+    /// motion into the edge so far
+    pushed: f64,
+    /// motion along the edge so far
+    slid: f64,
+    since: Instant,
+}
+
+enum PushState {
+    Pushing,
+    Through,
+    Gave,
+}
+
+enum PushOutcome {
+    /// cross with this (`Begin`) event
+    Cross(CaptureEvent),
+    /// keep watching the pointer
+    Wait,
+    /// stay on this screen, this far along the edge from where it arrived
+    StayHere(f64),
+}
+
+impl Push {
+    fn new(handle: CaptureHandle, pos: input_capture::Position, along: Option<u16>) -> Self {
+        Self {
+            handle,
+            pos,
+            along,
+            pushed: 0.0,
+            slid: 0.0,
+            since: Instant::now(),
+        }
+    }
+
+    fn update(&mut self, input: &Event) -> PushState {
+        let Event::Pointer(PointerEvent::Motion { dx, dy, .. }) = *input else {
+            // a click or key at the edge: it's meant for this screen
+            return PushState::Gave;
+        };
+        let (into, along) = match self.pos {
+            input_capture::Position::Left => (-dx, dy),
+            input_capture::Position::Right => (dx, dy),
+            input_capture::Position::Top => (-dy, dx),
+            input_capture::Position::Bottom => (dy, dx),
+        };
+        self.pushed += into;
+        self.slid += along;
+        if self.pushed >= PUSH_DISTANCE {
+            PushState::Through
+        } else if self.pushed < -2.0
+            || self.slid.abs() > self.pushed.max(0.0) + 10.0
+            || self.since.elapsed() > PUSH_TIMEOUT
+        {
+            PushState::Gave
+        } else {
+            PushState::Pushing
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -624,7 +748,51 @@ fn arranged_crossing(
 
 #[cfg(test)]
 mod tests {
-    use super::arranged_crossing;
+    use super::{Push, PushState, arranged_crossing};
+    use input_event::{Event, PointerEvent};
+
+    fn motion(dx: f64, dy: f64) -> Event {
+        Event::Pointer(PointerEvent::Motion { time: 0, dx, dy })
+    }
+
+    fn push_with(moves: &[(f64, f64)]) -> &'static str {
+        let mut push = Push::new(0, input_capture::Position::Left, Some(100));
+        for &(dx, dy) in moves {
+            match push.update(&motion(dx, dy)) {
+                PushState::Pushing => continue,
+                PushState::Through => return "cross",
+                PushState::Gave => return "stay",
+            }
+        }
+        "waiting"
+    }
+
+    #[test]
+    fn crossing_takes_a_push_through_the_edge() {
+        // the device is on the left: pushing left crosses, once far enough
+        assert_eq!(push_with(&[(-10.0, 0.0), (-10.0, 1.0)]), "waiting");
+        assert_eq!(
+            push_with(&[(-10.0, 0.0), (-10.0, 1.0), (-12.0, 0.0)]),
+            "cross"
+        );
+        // a diagonal push still crosses
+        assert_eq!(
+            push_with(&[(-12.0, 8.0), (-12.0, 8.0), (-12.0, 8.0)]),
+            "cross"
+        );
+        // sliding down along the edge stays here
+        assert_eq!(push_with(&[(-1.0, 6.0), (-1.0, 6.0), (-1.0, 6.0)]), "stay");
+        // so does moving back
+        assert_eq!(push_with(&[(-5.0, 0.0), (8.0, 0.0)]), "stay");
+        // and a click
+        let mut push = Push::new(0, input_capture::Position::Right, None);
+        let click = Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: 272,
+            state: 1,
+        });
+        assert!(matches!(push.update(&click), PushState::Gave));
+    }
 
     fn fraction(f: f64) -> u16 {
         (f * u16::MAX as f64).round() as u16
