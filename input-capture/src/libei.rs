@@ -76,13 +76,21 @@ enum LibeiNotifyEvent {
     Destroy(Position),
 }
 
+/// Asks the capture session to release the pointer, optionally moved along
+/// the edge (see [`LanMouseInputCapture::set_release_slide`]).
+#[derive(Default)]
+struct ReleaseRequest {
+    notify: Notify,
+    slide: std::sync::Mutex<f64>,
+}
+
 #[allow(dead_code)]
 pub struct LibeiInputCapture {
     input_capture: Pin<Box<InputCapture>>,
     capture_task: JoinHandle<Result<(), CaptureError>>,
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
-    notify_release: Arc<Notify>,
+    notify_release: Arc<ReleaseRequest>,
     cancellation_token: CancellationToken,
     terminated: bool,
 }
@@ -238,7 +246,7 @@ impl LibeiInputCapture {
 
         let (event_tx, event_rx) = mpsc::channel(1);
         let (notify_capture, notify_rx) = mpsc::channel(1);
-        let notify_release = Arc::new(Notify::new());
+        let notify_release = Arc::new(ReleaseRequest::default());
 
         let cancellation_token = CancellationToken::new();
 
@@ -269,7 +277,7 @@ impl LibeiInputCapture {
 async fn do_capture(
     input_capture: *const InputCapture,
     mut capture_event: Receiver<LibeiNotifyEvent>,
-    notify_release: Arc<Notify>,
+    notify_release: Arc<ReleaseRequest>,
     session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
     cancellation_token: CancellationToken,
@@ -370,7 +378,7 @@ async fn do_capture_session(
     event_tx: &Sender<(Position, CaptureEvent)>,
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
-    notify_release: &Notify,
+    notify_release: &ReleaseRequest,
     cancel: (CancellationToken, CancellationToken),
 ) -> Result<(), CaptureError> {
     let (cancel_session, cancel_update) = cancel;
@@ -450,7 +458,7 @@ async fn do_capture_session(
                     event_tx.send((pos, CaptureEvent::Begin { along })).await.expect("no channel");
 
                     tokio::select! {
-                        _ = notify_release.notified() => { /* capture release */
+                        _ = notify_release.notify.notified() => { /* capture release */
                             log::debug!("release session requested");
                         },
                         _ = release_session.notified() => { /* release session */
@@ -463,10 +471,11 @@ async fn do_capture_session(
                         },
                     }
 
-                    release_capture(input_capture, session, activated, pos).await?;
+                    let slide = std::mem::take(&mut *notify_release.slide.lock().expect("lock"));
+                    release_capture(input_capture, session, activated, pos, slide).await?;
 
                 }
-                _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
+                _ = notify_release.notify.notified() => { /* capture release -> we are not capturing anyway, so ignore */
                     log::debug!("release session requested");
                 },
                 _ = release_session.notified() => { /* release session */
@@ -507,6 +516,7 @@ async fn release_capture(
     session: &Session<InputCapture>,
     activated: Activated,
     current_pos: Position,
+    slide: f64,
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
@@ -522,8 +532,12 @@ async fn release_capture(
         Position::Top => (0., 1.),
         Position::Bottom => (0., -1.),
     };
-    // release 1px to the right of the entered zone
-    let cursor_position = (x as f64 + dx, y as f64 + dy);
+    // release 1px inside the entered zone, where it slid to along the edge
+    let (sx, sy) = match current_pos {
+        Position::Left | Position::Right => (0., slide),
+        Position::Top | Position::Bottom => (slide, 0.),
+    };
+    let cursor_position = (x as f64 + dx + sx, y as f64 + dy + sy);
     let release_options = ReleaseOptions::default()
         .set_activation_id(activated.activation_id())
         .set_cursor_position(Some(cursor_position));
@@ -651,8 +665,12 @@ impl LanMouseInputCapture for LibeiInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
-        self.notify_release.notify_waiters();
+        self.notify_release.notify.notify_waiters();
         Ok(())
+    }
+
+    fn set_release_slide(&mut self, slide: f64) {
+        *self.notify_release.slide.lock().expect("lock") = slide;
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {

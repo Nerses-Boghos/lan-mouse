@@ -207,7 +207,16 @@ fn build_ui(app: &Application) {
     }
 
     log::debug!("connecting to lan-mouse-socket");
-    let (mut frontend_rx, frontend_tx) = match lan_mouse_ipc::try_connect() {
+    let connection = if service_managed() {
+        // the system starts it: wait for it rather than starting another
+        lan_mouse_ipc::connect().map_err(|e| {
+            log::error!("{e}");
+            process::exit(1)
+        })
+    } else {
+        lan_mouse_ipc::try_connect()
+    };
+    let (mut frontend_rx, frontend_tx) = match connection {
         Ok(conn) => conn,
         Err(e) => {
             log::warn!("could not connect to daemon ({e}), spawning a new one");
@@ -233,16 +242,33 @@ fn build_ui(app: &Application) {
     log::debug!("connected to lan-mouse-socket");
 
     let (sender, receiver) = async_channel::bounded(10);
+    let (reconnected_tx, reconnected_rx) = async_channel::bounded(1);
 
+    // Read the service's events. If the service goes away (it restarts, or
+    // was stopped), wait for it to come back and carry on: this window and
+    // its pairing dialogs must not silently outlive it.
     gio::spawn_blocking(move || {
-        while let Some(e) = frontend_rx.next_event() {
-            match e {
-                Ok(e) => sender.send_blocking(e).unwrap(),
-                Err(e) => {
-                    log::error!("{e}");
-                    break;
+        loop {
+            while let Some(e) = frontend_rx.next_event() {
+                match e {
+                    Ok(e) => {
+                        if sender.send_blocking(e).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("{e}");
+                        break;
+                    }
                 }
             }
+            log::warn!("lost the connection to the Lan Mouse service, reconnecting");
+            let (rx, tx) = reconnect();
+            frontend_rx = rx;
+            if reconnected_tx.send_blocking(tx).is_err() {
+                return;
+            }
+            log::info!("reconnected to the Lan Mouse service");
         }
     });
 
@@ -282,6 +308,17 @@ fn build_ui(app: &Application) {
             }
         });
     }
+
+    // a new connection after the service came back: requests go there now
+    glib::spawn_future_local(clone!(
+        #[weak]
+        window,
+        async move {
+            while let Ok(writer) = reconnected_rx.recv().await {
+                window.set_request_writer(writer);
+            }
+        }
+    ));
 
     glib::spawn_future_local(clone!(
         #[weak]
@@ -363,5 +400,41 @@ fn build_ui(app: &Application) {
     #[cfg(target_os = "macos")]
     if env::var_os("LAN_MOUSE_HIDDEN").is_none() {
         window.present();
+    }
+}
+
+/// Whether the service is run by the system (a LaunchAgent sets
+/// `LAN_MOUSE_SERVICE_MANAGED`), so this app must never start its own.
+pub fn service_managed() -> bool {
+    env::var_os("LAN_MOUSE_SERVICE_MANAGED").is_some()
+}
+
+/// Connect to the service again after losing it. A service run by the
+/// system (a LaunchAgent, systemd) is restarted there; one this app started
+/// itself is started again if it doesn't come back on its own.
+fn reconnect() -> (
+    lan_mouse_ipc::FrontendEventReader,
+    lan_mouse_ipc::FrontendRequestWriter,
+) {
+    const START_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+    let lost = std::time::Instant::now();
+    let mut started = false;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if let Ok(conn) = lan_mouse_ipc::try_connect() {
+            return conn;
+        }
+        if !started && !service_managed() && lost.elapsed() > START_AFTER {
+            log::warn!("the Lan Mouse service didn't come back, starting it");
+            started = true;
+            if let Err(e) = env::current_exe().and_then(|exe| {
+                process::Command::new(exe)
+                    .args(env::args().skip(1))
+                    .arg("daemon")
+                    .spawn()
+            }) {
+                log::error!("failed to start the service: {e}");
+            }
+        }
     }
 }

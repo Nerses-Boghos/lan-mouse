@@ -219,7 +219,10 @@ impl Service {
                     self.broadcast_discovered();
                 }
                 _ = self.config.changed() => self.handle_config_change(),
-                r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
+                reason = termination() => {
+                    log::info!("stopping: {reason}");
+                    break;
+                }
             }
         }
 
@@ -1283,6 +1286,32 @@ fn arrangement_decision(
         ArrangementDecision::Take
     } else {
         ArrangementDecision::Send
+    }
+}
+
+/// Waits until this process is asked to stop, and says how.
+async fn termination() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut int), Ok(mut term), Ok(mut hup)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            let _ = signal::ctrl_c().await;
+            return "interrupted";
+        };
+        tokio::select! {
+            _ = int.recv() => "interrupted (SIGINT: Ctrl+C, or the app that started it quit)",
+            _ = term.recv() => "terminated (SIGTERM: e.g. the system stopping it, or logout)",
+            _ = hup.recv() => "hung up (SIGHUP: its terminal or session closed)",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+        "interrupted"
     }
 }
 

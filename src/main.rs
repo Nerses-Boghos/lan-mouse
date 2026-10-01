@@ -106,9 +106,13 @@ fn run() -> Result<(), LanMouseError> {
             //  run a frontend
             #[cfg(feature = "gtk")]
             {
-                // Only spawn a new daemon if one isn't already running
+                // Only spawn a new daemon if one isn't already running, and
+                // never when the system runs it (it may just be starting)
                 let mut service = if lan_mouse_ipc::is_service_running() {
                     log::info!("daemon already running, connecting to existing instance");
+                    None
+                } else if lan_mouse_gtk::service_managed() {
+                    log::info!("waiting for the daemon run by the system");
                     None
                 } else {
                     Some(start_service()?)
