@@ -4,6 +4,12 @@
 //! TXT record carries its certificate fingerprint. The fingerprint is only a
 //! hint for finding a device: pairing verifies it against the certificate
 //! presented over TLS.
+//!
+//! The service points at a host name of its own (`lan-mouse-<id>.local`),
+//! never at the machine's: that one belongs to the system's mDNS responder
+//! (Bonjour, Avahi), and answering for it too looks like a second machine
+//! with the same name, so macOS renames itself ("Name-2.local"). The
+//! machine's name travels in the TXT record (`host`).
 
 use std::{collections::HashMap, net::IpAddr};
 
@@ -38,7 +44,7 @@ impl Discovery {
         let daemon = ServiceDaemon::new()?;
         // Loopback addresses would lead other devices back to themselves.
         daemon.disable_interface(vec![IfKind::LoopbackV4, IfKind::LoopbackV6])?;
-        let host = format!("{hostname}.");
+        let host = hostname.to_owned();
         let info = announcement(name, &host, port, fingerprint)?;
         let announced = info.get_fullname().to_owned();
         daemon.register(info)?;
@@ -140,10 +146,17 @@ impl Discovery {
                     .map(IpAddr::V4)
                     .collect();
                 ips.sort();
+                // the machine's own name; older versions announced it directly
+                let hostname = info
+                    .get_property_val_str("host")
+                    .filter(|h| !h.is_empty())
+                    .unwrap_or_else(|| info.get_hostname())
+                    .trim_end_matches('.')
+                    .to_owned();
                 let peer = DiscoveredPeer {
                     fingerprint: fingerprint.to_owned(),
                     name: unescape(name),
-                    hostname: info.get_hostname().trim_end_matches('.').to_owned(),
+                    hostname,
                     ips,
                     port: info.get_port(),
                     paired: false,
@@ -167,15 +180,31 @@ impl Discovery {
     }
 }
 
-/// The DNS-SD record announcing this device.
+/// The DNS-SD record announcing this device, reachable at the machine's
+/// `.local` name `host`.
 fn announcement(
     name: &str,
     host: &str,
     port: u16,
     fingerprint: &str,
 ) -> Result<ServiceInfo, mdns_sd::Error> {
-    let properties = [("fp", fingerprint), ("v", PROTOCOL_VERSION)];
-    Ok(ServiceInfo::new(SERVICE_TYPE, name, host, "", port, &properties[..])?.enable_addr_auto())
+    let properties = [("fp", fingerprint), ("v", PROTOCOL_VERSION), ("host", host)];
+    let own_host = format!("{}.local.", announced_host_label(fingerprint));
+    Ok(
+        ServiceInfo::new(SERVICE_TYPE, name, &own_host, "", port, &properties[..])?
+            .enable_addr_auto(),
+    )
+}
+
+/// The host label this device's service points at: unique per device (its
+/// certificate) and never the machine's own name, see the module docs.
+fn announced_host_label(fingerprint: &str) -> String {
+    let id: String = fingerprint
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    format!("lan-mouse-{}", id.to_ascii_lowercase())
 }
 
 /// This machine's host name, without a `.local` suffix.
@@ -253,6 +282,19 @@ mod tests {
     fn host_labels_are_dns_safe() {
         assert_eq!(local_host_label("Nerses-MacBook-Air"), "Nerses-MacBook-Air");
         assert_eq!(local_host_label("My Mac (2)"), "My-Mac--2");
+    }
+
+    #[test]
+    fn the_service_never_claims_the_machines_name() {
+        let label = announced_host_label("40:4C:74:fe:46:e1");
+        assert_eq!(label, "lan-mouse-404c74fe");
+        let info = announcement("Mac", "Nerses-MacBook-Air.local", 4242, "40:4c:74:fe:46:e1")
+            .expect("announcement");
+        assert_eq!(info.get_hostname(), "lan-mouse-404c74fe.local.");
+        assert_eq!(
+            info.get_property_val_str("host"),
+            Some("Nerses-MacBook-Air.local")
+        );
     }
 
     #[test]

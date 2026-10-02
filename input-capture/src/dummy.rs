@@ -14,6 +14,9 @@ pub struct DummyInputCapture {
     start: Option<Instant>,
     interval: Interval,
     offset: (i32, i32),
+    /// released: reach the edge again (the circle goes on, so a later
+    /// attempt pushes through it)
+    begin_pending: bool,
 }
 
 impl DummyInputCapture {
@@ -22,6 +25,7 @@ impl DummyInputCapture {
             start: None,
             interval: time::interval(Duration::from_millis(1)),
             offset: (0, 0),
+            begin_pending: false,
         }
     }
 }
@@ -43,6 +47,7 @@ impl Capture for DummyInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
+        self.begin_pending = true;
         Ok(())
     }
 
@@ -59,6 +64,12 @@ impl Stream for DummyInputCapture {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let current = ready!(self.interval.poll_tick(cx));
+        if self.start.is_some() && std::mem::take(&mut self.begin_pending) {
+            return Poll::Ready(Some(Ok((
+                Position::Left,
+                CaptureEvent::Begin { along: None },
+            ))));
+        }
         let event = match self.start {
             None => {
                 self.start.replace(current);
