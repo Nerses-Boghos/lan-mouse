@@ -376,8 +376,14 @@ impl Service {
     }
 
     async fn handle_frontend_pending(&mut self) {
+        let mut pairing_asked = false;
         while let Some(event) = self.pending_frontend_events.pop_front() {
+            pairing_asked |= matches!(event, FrontendEvent::PairRequest { .. });
             self.frontend_listener.broadcast(event).await;
+        }
+        // A pairing request nobody sees would just time out as declined.
+        if pairing_asked && !self.frontend_listener.has_frontends() {
+            open_frontend();
         }
     }
 
@@ -968,6 +974,21 @@ impl Service {
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.notify_frontend(FrontendEvent::ClipboardStatus(self.config.clipboard()));
+        // requests that arrived before this frontend connected
+        self.pending_pairs.retain(|_, p| !p.reply.is_closed());
+        let requests: Vec<_> = self
+            .pending_pairs
+            .iter()
+            .map(|(fingerprint, p)| FrontendEvent::PairRequest {
+                fingerprint: fingerprint.clone(),
+                name: p.request.name.clone(),
+                code: p.code.clone(),
+                pos: p.request.pos,
+            })
+            .collect();
+        for request in requests {
+            self.notify_frontend(request);
+        }
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -1237,6 +1258,38 @@ fn display_name(peer: Option<&lan_mouse_ipc::DiscoveredPeer>) -> String {
 fn same_host(a: &str, b: &str) -> bool {
     a.trim_end_matches('.')
         .eq_ignore_ascii_case(b.trim_end_matches('.'))
+}
+
+/// Start the app that shows pairing requests, when none is connected: on
+/// macOS the menu bar app (the service may run without it). Elsewhere the
+/// desktop's own frontend (e.g. a bar widget) is expected to be running.
+fn open_frontend() {
+    #[cfg(target_os = "macos")]
+    {
+        // <bundle>/Contents/MacOS/lan-mouse
+        let bundle = std::env::current_exe().ok().and_then(|exe| {
+            let bundle = exe.parent()?.parent()?.parent()?.to_owned();
+            bundle
+                .extension()
+                .is_some_and(|e| e == "app")
+                .then_some(bundle)
+        });
+        let Some(bundle) = bundle else {
+            log::warn!("a pairing request is waiting, but no app is open to show it");
+            return;
+        };
+        log::info!("opening Lan Mouse to show a pairing request");
+        let opened = std::process::Command::new("/usr/bin/open")
+            .args(["-g", "--env", "LAN_MOUSE_HIDDEN=1"])
+            .args(["--env", "LAN_MOUSE_SERVICE_MANAGED=1"])
+            .arg(bundle)
+            .spawn();
+        if let Err(e) = opened {
+            log::warn!("could not open Lan Mouse: {e}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    log::warn!("a pairing request is waiting, but no app is open to show it");
 }
 
 fn now_millis() -> u64 {

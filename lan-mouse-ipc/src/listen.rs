@@ -91,6 +91,12 @@ impl AsyncFrontendListener {
         Ok(adapter)
     }
 
+    /// Whether any frontend was connected at the last broadcast (a closed
+    /// one is noticed when writing to it fails).
+    pub fn has_frontends(&self) -> bool {
+        !self.tx_streams.is_empty()
+    }
+
     pub async fn broadcast(&mut self, notify: FrontendEvent) {
         // encode event
         let mut json = serde_json::to_string(&notify).unwrap();
