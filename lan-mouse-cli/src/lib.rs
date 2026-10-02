@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use lan_mouse_ipc::{
     ClientHandle, ConnectionError, DiscoveredPeer, FrontendEvent, FrontendRequest, IpcError,
-    PairStatus, Position, connect_async,
+    PairStatus, Position, TransferState, connect_async,
 };
 
 #[derive(Debug, Error)]
@@ -68,6 +68,13 @@ enum CliSubcommand {
         /// name, host name or fingerprint (prefix) of the device, see `discover`
         device: String,
         pos: Position,
+    },
+    /// send files and folders to a paired device (into its Downloads)
+    Send {
+        /// name, host name or fingerprint (prefix) of the device, see `discover`
+        device: String,
+        #[arg(required = true)]
+        paths: Vec<std::path::PathBuf>,
     },
     /// accept a pairing request (fingerprint as shown with the request)
     PairAccept { fingerprint: String },
@@ -318,6 +325,72 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 }
             }
         }
+        CliSubcommand::Send { device, paths } => {
+            let peers = discovered(&mut rx, &mut tx).await?;
+            let peer = find_device(&peers, &device)?;
+            let fingerprint = peer.fingerprint.clone();
+            let paths = paths
+                .iter()
+                .map(|p| {
+                    std::path::absolute(p)
+                        .map_err(|e| CliError::Failed(format!("{}: {e}", p.display())))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // identifies this transfer's updates
+            let id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+                ^ std::process::id() as u64;
+            tx.request(FrontendRequest::SendFiles {
+                id,
+                fingerprint,
+                paths,
+            })
+            .await?;
+            let interactive = std::io::stderr().is_terminal();
+            while let Some(e) = rx.next().await {
+                let FrontendEvent::Transfer(t) = e? else {
+                    continue;
+                };
+                if t.id != id || t.incoming {
+                    continue;
+                }
+                match t.state {
+                    TransferState::Running => {
+                        if interactive && t.total > 0 {
+                            eprint!(
+                                "\rsending {} to {}: {}%   ",
+                                files_phrase(t.files),
+                                t.name,
+                                t.done * 100 / t.total
+                            );
+                        }
+                    }
+                    TransferState::Done { .. } => {
+                        if interactive {
+                            eprintln!();
+                        }
+                        println!(
+                            "Sent {} to {} ({}).",
+                            files_phrase(t.files),
+                            t.name,
+                            size_phrase(t.total)
+                        );
+                        break;
+                    }
+                    TransferState::Failed(e) => {
+                        if interactive {
+                            eprintln!();
+                        }
+                        return Err(CliError::Failed(format!(
+                            "sending to {} failed: {e}",
+                            t.name
+                        )));
+                    }
+                }
+            }
+        }
         CliSubcommand::PairAccept { fingerprint } => {
             tx.request(FrontendRequest::PairResponse {
                 fingerprint,
@@ -355,6 +428,29 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn files_phrase(files: usize) -> String {
+    if files == 1 {
+        "1 file".to_owned()
+    } else {
+        format!("{files} files")
+    }
+}
+
+fn size_phrase(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["bytes", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} bytes")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 async fn discovered(

@@ -13,7 +13,7 @@ use crate::{
 use futures::StreamExt;
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Monitor, PairStatus, Position, Status,
+    IpcListenerCreationError, Monitor, PairStatus, Position, Status, TransferState, TransferUpdate,
 };
 use log;
 use std::{
@@ -306,6 +306,11 @@ impl Service {
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::Discover => self.broadcast_discovered(),
+            FrontendRequest::SendFiles {
+                id,
+                fingerprint,
+                paths,
+            } => self.send_files(id, fingerprint, paths),
             FrontendRequest::SetClipboard(enabled) => {
                 if let Some(control) = &self.control {
                     control.set_clipboard(enabled);
@@ -592,6 +597,10 @@ impl Service {
                 fingerprint,
                 layout,
             } => self.apply_layout(&fingerprint, layout),
+            ControlEvent::Transfer(mut update) => {
+                update.name = self.device_name(&update.fingerprint);
+                self.notify_frontend(FrontendEvent::Transfer(update));
+            }
             ControlEvent::Finished {
                 fingerprint,
                 pos,
@@ -802,6 +811,64 @@ impl Service {
         self.activate_client(handle);
         self.save_config();
         log::info!("paired with {name} ({hostname}), placed {pos}");
+    }
+
+    /// Send files to the paired device with `fingerprint`: to where it is
+    /// announced on the network, or else where it is connected.
+    fn send_files(&mut self, id: u64, fingerprint: String, paths: Vec<std::path::PathBuf>) {
+        let announced = self
+            .discovery
+            .as_ref()
+            .and_then(|d| d.get(&fingerprint))
+            .and_then(|p| p.ips.first().map(|&ip| SocketAddr::new(ip, p.port)));
+        let connected = || {
+            let handle = self.client_manager.find_by_fingerprint(&fingerprint)?;
+            self.client_manager.active_addr(handle)
+        };
+        let addr = announced.or_else(connected);
+        let paired = self
+            .authorized_keys
+            .read()
+            .expect("lock")
+            .contains_key(&fingerprint);
+        let problem = match (&self.control, addr) {
+            _ if !paired => Some("that device isn't paired"),
+            (None, _) => Some("file transfer is unavailable"),
+            (_, None) => Some("the device isn't on the network"),
+            _ => None,
+        };
+        if let Some(problem) = problem {
+            let name = self.device_name(&fingerprint);
+            self.notify_frontend(FrontendEvent::Transfer(TransferUpdate {
+                id,
+                fingerprint,
+                name,
+                incoming: false,
+                files: 0,
+                done: 0,
+                total: 0,
+                state: TransferState::Failed(problem.to_owned()),
+            }));
+            return;
+        }
+        let (Some(control), Some(addr)) = (&self.control, addr) else {
+            return;
+        };
+        log::info!("sending {} items to {addr}", paths.len());
+        control.send_files(id, addr, fingerprint, paths);
+    }
+
+    /// What the user calls the device with `fingerprint`.
+    fn device_name(&self, fingerprint: &str) -> String {
+        if let Some(peer) = self.discovery.as_ref().and_then(|d| d.get(fingerprint)) {
+            return peer.name;
+        }
+        self.authorized_keys
+            .read()
+            .expect("lock")
+            .get(fingerprint)
+            .cloned()
+            .unwrap_or_else(|| fingerprint.chars().take(11).collect())
     }
 
     /// Place client `handle` at `pos` with `offset` (see

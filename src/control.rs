@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lan_mouse_ipc::{Monitor, Position};
+use lan_mouse_ipc::{Monitor, Position, TransferState, TransferUpdate};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::{
     DigitallySignedStruct, DistinguishedName, SignatureScheme,
@@ -43,7 +43,7 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use webrtc_dtls::crypto::Certificate;
 
-use crate::{clipboard, crypto};
+use crate::{clipboard, crypto, transfer};
 
 /// Largest message accepted or sent.
 const MAX_SIZE: usize = 16 * 1024 * 1024;
@@ -172,6 +172,8 @@ pub(crate) enum ControlEvent {
     Code { fingerprint: String, code: String },
     /// A paired device sent its monitors and arrangement.
     Layout { fingerprint: String, layout: Layout },
+    /// Files are being sent or received (`name` is left empty).
+    Transfer(TransferUpdate),
     /// A pairing started with [`Control::pair`] completed.
     Finished {
         fingerprint: String,
@@ -229,6 +231,9 @@ impl Control {
             event_tx: event_tx.clone(),
         };
         let accept_task = spawn_local(accept_loop(listener, acceptor.clone(), handler.clone()));
+        if let Some(downloads) = transfer::downloads_dir() {
+            transfer::remove_leftovers(&downloads);
+        }
         log::info!("control channel listening on tcp port {port}");
 
         Ok(Self {
@@ -348,6 +353,92 @@ impl Control {
         });
     }
 
+    /// Send `paths` (files and folders) as transfer `id` to the paired
+    /// device at `addr`, whose certificate must match `fingerprint`, in the
+    /// background; progress comes as [`ControlEvent::Transfer`].
+    pub(crate) fn send_files(
+        &self,
+        id: u64,
+        addr: SocketAddr,
+        fingerprint: String,
+        paths: Vec<std::path::PathBuf>,
+    ) {
+        let connector = self.connector.clone();
+        let authorized_keys = self.authorized_keys.clone();
+        let event_tx = self.event_tx.clone();
+        spawn_local(async move {
+            let update = |files, done, total, state| {
+                ControlEvent::Transfer(TransferUpdate {
+                    id,
+                    fingerprint: fingerprint.clone(),
+                    name: String::new(),
+                    incoming: false,
+                    files,
+                    done,
+                    total,
+                    state,
+                })
+            };
+            // walking folders may take a while: not on this thread
+            let selection = match tokio::task::spawn_blocking(move || transfer::select(&paths))
+                .await
+            {
+                Ok(Ok(selection)) => selection,
+                Ok(Err(e)) => {
+                    let _ = event_tx.send(update(0, 0, 0, TransferState::Failed(e.to_string())));
+                    return;
+                }
+                Err(e) => {
+                    let _ = event_tx.send(update(0, 0, 0, TransferState::Failed(e.to_string())));
+                    return;
+                }
+            };
+            for skipped in &selection.skipped {
+                log::info!(
+                    "not sending {}: not a regular file or folder",
+                    skipped.display()
+                );
+            }
+            let files = selection
+                .entries
+                .iter()
+                .filter(|e| e.kind == transfer::EntryKind::File)
+                .count();
+            let total: u64 = selection.entries.iter().map(|e| e.size).sum();
+            let _ = event_tx.send(update(files, 0, total, TransferState::Running));
+            let sending = async {
+                let (mut tls, peer) = connect(&connector, addr).await.map_err(|e| e.to_string())?;
+                if peer != fingerprint {
+                    return Err(ControlError::WrongPeer(peer).to_string());
+                }
+                check_authorized(&peer, &authorized_keys).map_err(|e| e.to_string())?;
+                transfer::send(&mut tls, id, &selection, |p| {
+                    let _ = event_tx.send(update(files, p.done, total, TransferState::Running));
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                let _ = tls.shutdown().await;
+                Ok::<_, String>(())
+            };
+            let state = match sending.await {
+                Ok(()) => {
+                    log::info!("sent {files} files ({total} bytes) to {addr}");
+                    TransferState::Done { saved: vec![] }
+                }
+                Err(e) => {
+                    log::warn!("sending files to {addr} failed: {e}");
+                    TransferState::Failed(e)
+                }
+            };
+            let done = if matches!(state, TransferState::Done { .. }) {
+                total
+            } else {
+                0
+            };
+            let _ = event_tx.send(update(files, done, total, state));
+        });
+    }
+
     /// Ask the device at `addr`, whose certificate must match `fingerprint`,
     /// to pair; it will sit at `pos` relative to this one.
     ///
@@ -445,11 +536,14 @@ impl Handler {
         // Decide what this peer may send before reading (and allocating) it.
         let paired = check_authorized(&fingerprint, &self.authorized_keys).is_ok();
         match kind {
-            KIND_CLIPBOARD | KIND_LAYOUT if !paired => {
+            KIND_CLIPBOARD | KIND_LAYOUT | transfer::KIND_OFFER if !paired => {
                 return Err(ControlError::Unauthorized(fingerprint));
             }
             KIND_LAYOUT if len > MAX_LAYOUT_SIZE => return Err(ControlError::TooLarge(len)),
-            KIND_CLIPBOARD | KIND_LAYOUT | KIND_PAIR_REQUEST => {}
+            transfer::KIND_OFFER if len > transfer::MAX_OFFER_SIZE => {
+                return Err(ControlError::TooLarge(len));
+            }
+            KIND_CLIPBOARD | KIND_LAYOUT | KIND_PAIR_REQUEST | transfer::KIND_OFFER => {}
             kind => return Err(ControlError::UnexpectedKind(kind)),
         }
         let limit = if paired { MAX_SIZE } else { MAX_UNPAIRED_SIZE };
@@ -468,6 +562,10 @@ impl Handler {
                     .borrow_mut()
                     .insert(addr.ip(), (digest(&payload), Instant::now()));
                 log::info!("received clipboard ({} bytes) from {addr}", payload.len());
+                Ok(())
+            }
+            transfer::KIND_OFFER => {
+                self.receive_files(tls, &payload, fingerprint, addr).await;
                 Ok(())
             }
             KIND_LAYOUT => {
@@ -530,6 +628,61 @@ impl Handler {
             }
             kind => Err(ControlError::UnexpectedKind(kind)),
         }
+    }
+
+    /// Receive files a paired device sends, into the downloads folder.
+    async fn receive_files<S>(
+        &self,
+        tls: &mut S,
+        offer: &[u8],
+        fingerprint: String,
+        addr: SocketAddr,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let Some(dest) = transfer::downloads_dir() else {
+            log::warn!("refusing files from {addr}: no downloads folder");
+            return;
+        };
+        let Ok(header) = serde_json::from_slice::<transfer::Offer>(offer) else {
+            return;
+        };
+        let (files, total) = (header.files(), header.total_bytes());
+        let update = |state, done| {
+            ControlEvent::Transfer(TransferUpdate {
+                id: header.id,
+                fingerprint: fingerprint.clone(),
+                name: String::new(),
+                incoming: true,
+                files,
+                done,
+                total,
+                state,
+            })
+        };
+        log::info!("receiving {files} files ({total} bytes) from {addr}");
+        let _ = self.event_tx.send(update(TransferState::Running, 0));
+        let event_tx = self.event_tx.clone();
+        let result = transfer::receive(tls, offer, &dest, |p| {
+            let _ = event_tx.send(update(TransferState::Running, p.done));
+        })
+        .await;
+        let state = match result {
+            Ok(saved) => {
+                log::info!("received {files} files from {addr} into {}", dest.display());
+                TransferState::Done { saved }
+            }
+            Err(e) => {
+                log::warn!("receiving files from {addr} failed: {e}");
+                TransferState::Failed(e.to_string())
+            }
+        };
+        let done = if matches!(state, TransferState::Done { .. }) {
+            total
+        } else {
+            0
+        };
+        let _ = self.event_tx.send(update(state, done));
     }
 
     /// Allow a pairing code exchange if fewer than [`MAX_EXCHANGES`] started

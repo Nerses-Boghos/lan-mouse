@@ -226,6 +226,32 @@ pub struct ClientState {
     pub refused: bool,
 }
 
+/// Sending or receiving files: how far along, or how it ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferUpdate {
+    pub id: u64,
+    /// the other device
+    pub fingerprint: String,
+    pub name: String,
+    /// receiving (true) or sending
+    pub incoming: bool,
+    pub files: usize,
+    /// bytes so far, of `total`
+    pub done: u64,
+    pub total: u64,
+    pub state: TransferState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferState {
+    Running,
+    /// where the received items were saved (empty when sending)
+    Done {
+        saved: Vec<std::path::PathBuf>,
+    },
+    Failed(String),
+}
+
 /// A monitor's area in its device's logical pixels.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Monitor {
@@ -278,6 +304,8 @@ pub enum FrontendEvent {
     Discovered(Vec<DiscoveredPeer>),
     /// the keyboard and mouse control this client now (`None`: this device)
     Controlling(Option<ClientHandle>),
+    /// progress or outcome of sending or receiving files
+    Transfer(TransferUpdate),
     /// whether the clipboard follows the cursor to other devices
     ClipboardStatus(bool),
     /// a device asks to pair; answer with [`FrontendRequest::PairResponse`].
@@ -374,6 +402,13 @@ pub enum FrontendRequest {
     Discover,
     /// share the clipboard with other devices, or stop
     SetClipboard(bool),
+    /// send files and folders (absolute paths) to the paired device with
+    /// this fingerprint; `id` identifies the transfer in its updates
+    SendFiles {
+        id: u64,
+        fingerprint: String,
+        paths: Vec<std::path::PathBuf>,
+    },
     /// pair with a discovered device that will sit at `pos` relative to this one
     Pair { fingerprint: String, pos: Position },
     /// accept or decline a [`FrontendEvent::PairRequest`]

@@ -33,7 +33,7 @@ pub(crate) fn local_commit_str() -> String {
         .to_string()
 }
 
-use lan_mouse_ipc::{FrontendEvent, PairStatus};
+use lan_mouse_ipc::{FrontendEvent, PairStatus, TransferState};
 
 use adw::Application;
 use gtk::{IconTheme, gdk::Display, glib::clone, prelude::*};
@@ -362,6 +362,31 @@ fn build_ui(app: &Application) {
                             PairStatus::Failed(e) => format!("Pairing with {name} failed: {e}"),
                         };
                         window.show_toast(&msg);
+                    }
+                    FrontendEvent::Transfer(t) => {
+                        let what = if t.files == 1 {
+                            "1 file".to_owned()
+                        } else {
+                            format!("{} files", t.files)
+                        };
+                        let msg = match (&t.state, t.incoming) {
+                            (TransferState::Done { .. }, true) => {
+                                Some(format!("Received {what} from {} (in Downloads)", t.name))
+                            }
+                            (TransferState::Done { .. }, false) => {
+                                Some(format!("Sent {what} to {}", t.name))
+                            }
+                            (TransferState::Failed(e), true) => {
+                                Some(format!("Receiving files from {} failed: {e}", t.name))
+                            }
+                            (TransferState::Failed(e), false) => {
+                                Some(format!("Sending files to {} failed: {e}", t.name))
+                            }
+                            (TransferState::Running, _) => None,
+                        };
+                        if let Some(msg) = msg {
+                            window.show_toast(&msg);
+                        }
                     }
                     FrontendEvent::Discovered(_)
                     | FrontendEvent::Controlling(_)
