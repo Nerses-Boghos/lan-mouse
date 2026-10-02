@@ -251,25 +251,39 @@ impl Stream for InputCapture {
             return Poll::Ready(Some(Ok(e)));
         }
 
-        // ready
-        let event = ready!(self.capture.poll_next_unpin(cx));
+        // Events for a position nobody captures any more (a client was
+        // just removed) are dropped. Keep polling then: returning Pending
+        // after the backend returned an event would leave no wakeup
+        // registered, and capture would stall until something else woke
+        // the task (on an idle machine: never).
+        let (pos, event) = loop {
+            // ready
+            let event = ready!(self.capture.poll_next_unpin(cx));
 
-        // stream closed
-        let event = match event {
-            Some(e) => e,
-            None => return Poll::Ready(None),
+            // stream closed
+            let event = match event {
+                Some(e) => e,
+                None => return Poll::Ready(None),
+            };
+
+            // error occurred
+            let (pos, event) = match event {
+                Ok(e) => e,
+                Err(e) => return Poll::Ready(Some(Err(e))),
+            };
+
+            // handle key presses
+            if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) =
+                event
+            {
+                self.update_pressed_keys(key, state);
+            }
+
+            if self.position_map.contains_key(&pos) {
+                break (pos, event);
+            }
+            log::debug!("dropping {event:?} @ {pos}: nothing captures there");
         };
-
-        // error occurred
-        let (pos, event) = match event {
-            Ok(e) => e,
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        };
-
-        // handle key presses
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
-            self.update_pressed_keys(key, state);
-        }
 
         let len = self
             .position_map
@@ -278,7 +292,7 @@ impl Stream for InputCapture {
             .unwrap_or(0);
 
         match len {
-            0 => Poll::Pending,
+            0 => unreachable!("checked above"),
             1 => Poll::Ready(Some(Ok((
                 self.position_map.get(&pos).expect("no id")[0],
                 event,
@@ -378,4 +392,62 @@ async fn create(
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use futures::task::noop_waker;
+    use std::{pin::Pin, task::Context};
+
+    /// A backend that yields queued events, then waits.
+    struct Queued(VecDeque<(Position, CaptureEvent)>);
+
+    impl Stream for Queued {
+        type Item = Result<(Position, CaptureEvent), CaptureError>;
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match self.0.pop_front() {
+                Some(e) => Poll::Ready(Some(Ok(e))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Capture for Queued {
+        async fn create(&mut self, _: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn destroy(&mut self, _: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn release(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn terminate(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn events_for_removed_clients_dont_stall_capture() {
+        let begin = CaptureEvent::Begin { along: None };
+        let mut capture = InputCapture {
+            capture: Box::new(Queued(VecDeque::from([
+                // the client on the left was just removed
+                (Position::Left, begin),
+                (Position::Right, begin),
+            ]))),
+            pressed_keys: HashSet::new(),
+            position_map: HashMap::from([(Position::Right, vec![7])]),
+            id_map: HashMap::from([(7, Position::Right)]),
+            pending: VecDeque::new(),
+        };
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match Pin::new(&mut capture).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok((7, CaptureEvent::Begin { .. })))) => {}
+            other => panic!("the event for the client on the right was held back: {other:?}"),
+        }
+    }
 }

@@ -227,12 +227,32 @@ impl CaptureTask {
     }
 
     async fn run(mut self) {
+        // Capture can stop on its own, e.g. macOS turns event taps off
+        // while a password field is focused (the lock screen after
+        // sleep). Nobody may be around to re-enable it by hand, so try
+        // again by ourselves, backing off while it keeps failing.
+        const RETRY: [u64; 5] = [2, 5, 10, 30, 60];
+        let mut failures = 0;
         loop {
+            let started = Instant::now();
             if let Err(e) = self.do_capture().await {
                 log::warn!("input capture exited: {e}");
             }
+            if self.cancellation_token.is_cancelled() {
+                return;
+            }
+            // a session that ran for a while was fine: start over quickly
+            if started.elapsed() > Duration::from_secs(60) {
+                failures = 0;
+            }
+            let wait = Duration::from_secs(RETRY[failures.min(RETRY.len() - 1)]);
+            failures += 1;
+            log::info!("restarting input capture in {}s", wait.as_secs());
+            let retry = tokio::time::sleep(wait);
+            tokio::pin!(retry);
             loop {
                 tokio::select! {
+                    _ = &mut retry => break,
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
