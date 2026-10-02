@@ -7,6 +7,7 @@ use crate::{
     crypto,
     discovery::{self, Discovery},
     dns::{DnsEvent, DnsResolver},
+    drag,
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
 };
@@ -91,6 +92,18 @@ pub struct Service {
     layout_sent: HashMap<ClientHandle, SocketAddr>,
     /// this device's monitors, as last sent to other devices
     monitors: Vec<Monitor>,
+    /// the current visit to another device, for drags carried there
+    visit: Option<Visit>,
+}
+
+/// While the keyboard and mouse control another device: a file drag
+/// carried there is dropped when the button is released there, and taken
+/// back when the pointer returns with the button still held.
+struct Visit {
+    handle: ClientHandle,
+    released: bool,
+    /// the outcome of the drag, for its transfer
+    drag: Option<tokio::sync::watch::Sender<Option<bool>>>,
 }
 
 /// Pairing requests waiting for an answer at the same time; more are declined.
@@ -179,6 +192,7 @@ impl Service {
             next_trigger_handle: 0,
             layout_sent: Default::default(),
             monitors: local_monitors(),
+            visit: None,
         };
         Ok(service)
     }
@@ -479,6 +493,14 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
+                self.visit = Some(Visit {
+                    handle,
+                    released: false,
+                    drag: None,
+                });
+                if let Some(files) = drag::dragged_files() {
+                    self.carry_drag(handle, files);
+                }
                 self.notify_frontend(FrontendEvent::Controlling(Some(handle)));
                 self.spawn_hook_command(handle, HookKind::Enter);
                 if let (Some(control), Some(addr)) =
@@ -487,8 +509,33 @@ impl Service {
                     control.send_clipboard(addr);
                 }
             }
+            ICaptureEvent::PrimaryReleased(handle) => {
+                if let Some(visit) = self.visit.as_mut().filter(|v| v.handle == handle) {
+                    visit.released = true;
+                    if let Some(drag) = &visit.drag {
+                        log::info!("dropped the dragged files on client {handle}");
+                        let _ = drag.send(Some(true));
+                    }
+                }
+            }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
+                if let Some(visit) = self.visit.take().filter(|v| v.handle == handle) {
+                    if let Some(drag) = visit.drag {
+                        if visit.released {
+                            // dropped there; here the drag still waits for
+                            // the release that went there: cancel it, once
+                            // input flows here again
+                            tokio::task::spawn_local(async {
+                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                drag::cancel_local_drag();
+                            });
+                        } else {
+                            // back with the button held: taken back
+                            let _ = drag.send(Some(false));
+                        }
+                    }
+                }
                 self.notify_frontend(FrontendEvent::Controlling(None));
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
@@ -855,7 +902,30 @@ impl Service {
             return;
         };
         log::info!("sending {} items to {addr}", paths.len());
-        control.send_files(id, addr, fingerprint, paths);
+        control.send_files(id, addr, fingerprint, paths, None);
+    }
+
+    /// Start sending the files of a drag that just crossed to client
+    /// `handle`; they are kept there only if it ends in a drop there.
+    fn carry_drag(&mut self, handle: ClientHandle, files: Vec<std::path::PathBuf>) {
+        let Some(fingerprint) = self.client_fingerprint(handle) else {
+            log::info!("not carrying the drag: client {handle} isn't paired");
+            return;
+        };
+        let Some(addr) = self.client_manager.active_addr(handle) else {
+            return;
+        };
+        let (Some(control), Some(visit)) = (&self.control, self.visit.as_mut()) else {
+            return;
+        };
+        let (outcome, drag) = tokio::sync::watch::channel(None);
+        visit.drag = Some(outcome);
+        let id = now_millis() ^ (files.len() as u64).rotate_left(48);
+        log::info!(
+            "carrying a drag of {} items to client {handle}",
+            files.len()
+        );
+        control.send_files(id, addr, fingerprint, files, Some(drag));
     }
 
     /// What the user calls the device with `fingerprint`.

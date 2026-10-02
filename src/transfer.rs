@@ -13,6 +13,12 @@
 //!                        ◀───────────  DONE | REFUSE {reason}
 //! ```
 //!
+//! A dragged transfer starts streaming as soon as the drag crosses, before
+//! the user lets go (`on_drop` in the offer). The sender then reports the
+//! outcome of the drag with a `DROP` or `CANCEL` frame, before, between or
+//! after the data frames; the receiver moves the files into place only
+//! after a `DROP`, and discards them on `CANCEL`.
+//!
 //! File contents follow the entries in order; their sizes delimit them.
 //! Either side ends a transfer by closing the connection; the receiver then
 //! removes the staging folder, so a cut-off transfer leaves nothing behind
@@ -38,6 +44,11 @@ const KIND_REFUSE: u8 = 12;
 const KIND_CHUNK: u8 = 13;
 const KIND_END: u8 = 14;
 const KIND_DONE: u8 = 15;
+const KIND_DROP: u8 = 16;
+const KIND_CANCEL: u8 = 17;
+
+/// How long a dragged transfer waits for the user to let go.
+const DROP_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// Size of the data frames.
 const CHUNK: usize = 256 * 1024;
@@ -77,6 +88,8 @@ pub(crate) enum TransferError {
     Stalled,
     #[error("nothing to send")]
     Empty,
+    #[error("cancelled")]
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +112,9 @@ pub(crate) struct Entry {
 pub(crate) struct Offer {
     pub(crate) id: u64,
     pub(crate) entries: Vec<Entry>,
+    /// a drag: keep the files until the sender reports the drop
+    #[serde(default)]
+    pub(crate) on_drop: bool,
 }
 
 impl Offer {
@@ -424,17 +440,47 @@ fn refusal(payload: &[u8]) -> TransferError {
     TransferError::Refused(reason)
 }
 
+/// The outcome of a drag: `None` while the user still holds it, then
+/// `Some(true)` for a drop on the other device, `Some(false)` if cancelled.
+pub(crate) type DragOutcome = tokio::sync::watch::Receiver<Option<bool>>;
+
+/// Tell the receiver the outcome of the drag once it is known (and only
+/// once): `Cancelled` ends the transfer.
+async fn report_drag<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    drag: &mut Option<DragOutcome>,
+) -> Result<(), TransferError> {
+    let outcome = drag.as_ref().and_then(|d| *d.borrow());
+    match outcome {
+        None => Ok(()),
+        Some(dropped) => {
+            *drag = None;
+            write_frame(stream, if dropped { KIND_DROP } else { KIND_CANCEL }, &[]).await?;
+            stream.flush().await?;
+            if dropped {
+                Ok(())
+            } else {
+                Err(TransferError::Cancelled)
+            }
+        }
+    }
+}
+
 /// Send `selection` as transfer `id` over `stream` (after the TLS handshake
-/// with a paired device). `progress` gets throttled updates.
+/// with a paired device). With `drag`, the files are carried by a drag in
+/// progress: the receiver keeps them only if it ends in a drop there.
+/// `progress` gets throttled updates.
 pub(crate) async fn send<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     id: u64,
     selection: &Selection,
+    mut drag: Option<DragOutcome>,
     progress: impl FnMut(Progress),
 ) -> Result<(), TransferError> {
     let offer = Offer {
         id,
         entries: selection.entries.clone(),
+        on_drop: drag.is_some(),
     };
     let (files, total) = (offer.files(), offer.total_bytes());
     let mut reporter = Reporter {
@@ -471,6 +517,7 @@ pub(crate) async fn send<S: AsyncRead + AsyncWrite + Unpin>(
                 )));
             }
             hash.update(&buf[..n]);
+            report_drag(stream, &mut drag).await?;
             stalling(write_frame(stream, KIND_CHUNK, &buf[..n])).await?;
             left -= n as u64;
             done += n as u64;
@@ -488,6 +535,13 @@ pub(crate) async fn send<S: AsyncRead + AsyncWrite + Unpin>(
     let digest: [u8; 32] = hash.finalize().into();
     write_frame(stream, KIND_END, &digest).await?;
     stream.flush().await?;
+    // everything is there: wait for the user to let go (or give up)
+    if let Some(mut outcome) = drag.take() {
+        let decided = tokio::time::timeout(DROP_WAIT, outcome.wait_for(Option::is_some)).await;
+        let dropped = matches!(decided, Ok(Ok(ref d)) if **d == Some(true));
+        let mut decided = Some(tokio::sync::watch::channel(Some(dropped)).1);
+        report_drag(stream, &mut decided).await?;
+    }
     match stalling(read_frame(stream, 64 * 1024)).await? {
         (KIND_DONE, _) => {}
         (KIND_REFUSE, reason) => return Err(refusal(&reason)),
@@ -555,6 +609,8 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
         report: progress,
         last: None,
     };
+    // whether the files are wanted: always, unless they come with a drag
+    let mut dropped = !offer.on_drop;
     let mut hash = Sha256::new();
     let mut done = 0u64;
     // data from the current chunk not written yet
@@ -581,9 +637,13 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
         let mut left = entry.size;
         while left > 0 {
             if pending_at == pending.len() {
-                pending = match stalling(read_frame(stream, CHUNK)).await? {
-                    (KIND_CHUNK, data) if !data.is_empty() => data,
-                    (kind, _) => return Err(TransferError::UnexpectedKind(kind)),
+                pending = loop {
+                    match stalling(read_frame(stream, CHUNK)).await? {
+                        (KIND_CHUNK, data) if !data.is_empty() => break data,
+                        (KIND_DROP, _) => dropped = true,
+                        (KIND_CANCEL, _) => return Err(TransferError::Cancelled),
+                        (kind, _) => return Err(TransferError::UnexpectedKind(kind)),
+                    }
                 };
                 pending_at = 0;
             }
@@ -615,10 +675,14 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
         refuse(stream, &e).await;
         return Err(e);
     }
-    let (kind, digest) = stalling(read_frame(stream, 64)).await?;
-    if kind != KIND_END {
-        return Err(TransferError::UnexpectedKind(kind));
-    }
+    let digest = loop {
+        match stalling(read_frame(stream, 64)).await? {
+            (KIND_END, digest) => break digest,
+            (KIND_DROP, _) => dropped = true,
+            (KIND_CANCEL, _) => return Err(TransferError::Cancelled),
+            (kind, _) => return Err(TransferError::UnexpectedKind(kind)),
+        }
+    };
     let ours: [u8; 32] = hash.finalize().into();
     if digest.as_slice() != ours.as_slice() {
         let e = TransferError::Corrupted;
@@ -626,7 +690,19 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(e);
     }
 
-    // complete: move every dragged item into place, under a free name
+    // complete; a drag must still end in a drop here
+    if !dropped {
+        let outcome = tokio::time::timeout(DROP_WAIT, read_frame(stream, 64))
+            .await
+            .map_err(|_| TransferError::Cancelled)??;
+        match outcome {
+            (KIND_DROP, _) => {}
+            (KIND_CANCEL, _) => return Err(TransferError::Cancelled),
+            (kind, _) => return Err(TransferError::UnexpectedKind(kind)),
+        }
+    }
+
+    // move every dragged item into place, under a free name
     let mut saved = vec![];
     let mut moved = HashSet::new();
     for entry in &offer.entries {
@@ -736,6 +812,7 @@ mod tests {
         let offer = Offer {
             id: 1,
             entries: vec![entry("a"), entry("a")],
+            on_drop: false,
         };
         assert!(check_offer(&offer).is_err());
     }
@@ -772,7 +849,7 @@ mod tests {
     async fn transfer(paths: &[PathBuf], dest: &Path) -> Result<Vec<PathBuf>, TransferError> {
         let selection = select(paths)?;
         let (mut a, mut b) = duplex(64 * 1024);
-        let sender = async { send(&mut a, 7, &selection, |_| {}).await };
+        let sender = async { send(&mut a, 7, &selection, None, |_| {}).await };
         let receiver = async {
             let (kind, offer) = read_frame(&mut b, MAX_OFFER_SIZE).await?;
             assert_eq!(kind, KIND_OFFER);
@@ -830,6 +907,7 @@ mod tests {
             let offer = Offer {
                 id: 9,
                 entries: selection.entries.clone(),
+                on_drop: false,
             };
             write_frame(&mut a, KIND_OFFER, &serde_json::to_vec(&offer).unwrap())
                 .await
@@ -858,6 +936,7 @@ mod tests {
         let sender = async {
             let offer = Offer {
                 id: 3,
+                on_drop: false,
                 entries: vec![Entry {
                     path: "a.txt".to_owned(),
                     kind: EntryKind::File,
@@ -892,6 +971,7 @@ mod tests {
         let (mut a, mut b) = duplex(64 * 1024);
         let offer = Offer {
             id: 4,
+            on_drop: false,
             entries: vec![Entry {
                 path: "../outside.txt".to_owned(),
                 kind: EntryKind::File,
@@ -904,6 +984,67 @@ mod tests {
         assert!(matches!(received, Err(TransferError::UnsafeName(_))));
         assert_eq!(answer.unwrap().0, KIND_REFUSE);
         assert!(!dir.join("outside.txt").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Drag `src` over and end the drag with `outcome` after `delay` (the
+    /// user lets go while the data is still on its way, or after).
+    async fn drag(
+        src: &Path,
+        dest: &Path,
+        outcome: bool,
+        delay: Duration,
+    ) -> Result<Vec<PathBuf>, TransferError> {
+        let selection = select(&[src.to_owned()])?;
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let (mut a, mut b) = duplex(64 * 1024);
+        let sender = async { send(&mut a, 11, &selection, Some(rx), |_| {}).await };
+        let user = async {
+            tokio::time::sleep(delay).await;
+            tx.send(Some(outcome)).unwrap();
+        };
+        let receiver = async {
+            let (_, offer) = read_frame(&mut b, MAX_OFFER_SIZE).await?;
+            receive(&mut b, &offer, dest, |_| {}).await
+        };
+        let (sent, (), received) = tokio::join!(sender, user, receiver);
+        if outcome {
+            sent?;
+        }
+        received
+    }
+
+    #[tokio::test]
+    async fn dragged_files_arrive_once_dropped() {
+        let dir = temp_dir("drop");
+        let src = dir.join("big.bin");
+        fs::write(&src, vec![7u8; 5 * CHUNK]).unwrap();
+        let dest = dir.join("Downloads");
+        // let go right away, while the data streams
+        let saved = drag(&src, &dest, true, Duration::ZERO).await.unwrap();
+        assert_eq!(fs::read(&saved[0]).unwrap(), vec![7u8; 5 * CHUNK]);
+        // let go after everything arrived
+        let saved = drag(&src, &dest, true, Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert_eq!(saved, [dest.join("big (2).bin")]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_drag_taken_back_leaves_nothing() {
+        let dir = temp_dir("taken-back");
+        let src = dir.join("big.bin");
+        fs::write(&src, vec![7u8; 5 * CHUNK]).unwrap();
+        let dest = dir.join("Downloads");
+        for delay in [Duration::ZERO, Duration::from_millis(300)] {
+            let received = drag(&src, &dest, false, delay).await;
+            assert!(
+                matches!(received, Err(TransferError::Cancelled)),
+                "{received:?}"
+            );
+            assert_eq!(fs::read_dir(&dest).unwrap().count(), 0, "leftovers");
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

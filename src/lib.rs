@@ -8,6 +8,7 @@ mod control;
 mod crypto;
 mod discovery;
 mod dns;
+mod drag;
 mod emulation;
 pub mod emulation_test;
 mod listen;

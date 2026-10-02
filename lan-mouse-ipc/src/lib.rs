@@ -250,6 +250,8 @@ pub enum TransferState {
         saved: Vec<std::path::PathBuf>,
     },
     Failed(String),
+    /// a drag taken back before it was dropped
+    Cancelled,
 }
 
 /// A monitor's area in its device's logical pixels.

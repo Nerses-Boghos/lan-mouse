@@ -355,13 +355,15 @@ impl Control {
 
     /// Send `paths` (files and folders) as transfer `id` to the paired
     /// device at `addr`, whose certificate must match `fingerprint`, in the
-    /// background; progress comes as [`ControlEvent::Transfer`].
+    /// background; progress comes as [`ControlEvent::Transfer`]. With
+    /// `drag`, they are carried by a drag, see [`transfer::send`].
     pub(crate) fn send_files(
         &self,
         id: u64,
         addr: SocketAddr,
         fingerprint: String,
         paths: Vec<std::path::PathBuf>,
+        drag: Option<transfer::DragOutcome>,
     ) {
         let connector = self.connector.clone();
         let authorized_keys = self.authorized_keys.clone();
@@ -412,18 +414,25 @@ impl Control {
                     return Err(ControlError::WrongPeer(peer).to_string());
                 }
                 check_authorized(&peer, &authorized_keys).map_err(|e| e.to_string())?;
-                transfer::send(&mut tls, id, &selection, |p| {
+                let sent = transfer::send(&mut tls, id, &selection, drag, |p| {
                     let _ = event_tx.send(update(files, p.done, total, TransferState::Running));
                 })
-                .await
-                .map_err(|e| e.to_string())?;
+                .await;
+                match sent {
+                    Err(transfer::TransferError::Cancelled) => return Ok(false),
+                    sent => sent.map_err(|e| e.to_string())?,
+                }
                 let _ = tls.shutdown().await;
-                Ok::<_, String>(())
+                Ok::<_, String>(true)
             };
             let state = match sending.await {
-                Ok(()) => {
+                Ok(true) => {
                     log::info!("sent {files} files ({total} bytes) to {addr}");
                     TransferState::Done { saved: vec![] }
+                }
+                Ok(false) => {
+                    log::info!("the drag to {addr} was taken back");
+                    TransferState::Cancelled
                 }
                 Err(e) => {
                     log::warn!("sending files to {addr} failed: {e}");
@@ -671,6 +680,10 @@ impl Handler {
             Ok(saved) => {
                 log::info!("received {files} files from {addr} into {}", dest.display());
                 TransferState::Done { saved }
+            }
+            Err(transfer::TransferError::Cancelled) => {
+                log::info!("the files dragged over from {addr} were taken back");
+                TransferState::Cancelled
             }
             Err(e) => {
                 log::warn!("receiving files from {addr} failed: {e}");

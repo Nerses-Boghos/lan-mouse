@@ -452,6 +452,10 @@ fn create_event_tap<'a>(
                                    event_type: CGEventType,
                                    cg_ev: &CGEvent| {
         log::trace!("Got event from tap: {event_type:?}");
+        // a drag carries files only if they were written after its press
+        if matches!(event_type, CGEventType::LeftMouseDown) {
+            crate::macos_drag::note_press();
+        }
         let mut state = client_state.blocking_lock();
         let mut capture_position = None;
         let mut res_events = vec![];

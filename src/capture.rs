@@ -45,6 +45,9 @@ pub(crate) enum ICaptureEvent {
     /// remote `Leave`, explicit `Release` request, send
     /// failure, or destroy of the active capture).
     ClientLeft(u64),
+    /// The left button was released while controlling this client (the end
+    /// of a drag carried over to it is a drop there).
+    PrimaryReleased(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -448,6 +451,21 @@ impl CaptureTask {
             self.active_client.replace(handle);
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
+                .expect("channel closed");
+        }
+
+        if self.active_client == Some(handle)
+            && matches!(
+                event,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+                    button: input_event::BTN_LEFT,
+                    state: 0,
+                    ..
+                }))
+            )
+        {
+            self.event_tx
+                .send(ICaptureEvent::PrimaryReleased(handle))
                 .expect("channel closed");
         }
 

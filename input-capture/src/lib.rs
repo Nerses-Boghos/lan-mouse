@@ -23,6 +23,19 @@ mod libei;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_drag;
+
+/// The files of a drag in progress on this device (with the left button
+/// held for it), where the platform shows them to other processes.
+#[cfg(target_os = "macos")]
+pub use macos_drag::current_drag;
+
+/// The files of a drag in progress on this device: not readable here.
+#[cfg(not(target_os = "macos"))]
+pub fn current_drag() -> Option<Vec<std::path::PathBuf>> {
+    None
+}
 
 #[cfg(layer_shell)]
 mod layer_shell;

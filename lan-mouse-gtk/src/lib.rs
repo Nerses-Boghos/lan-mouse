@@ -382,7 +382,7 @@ fn build_ui(app: &Application) {
                             (TransferState::Failed(e), false) => {
                                 Some(format!("Sending files to {} failed: {e}", t.name))
                             }
-                            (TransferState::Running, _) => None,
+                            (TransferState::Running | TransferState::Cancelled, _) => None,
                         };
                         if let Some(msg) = msg {
                             window.show_toast(&msg);

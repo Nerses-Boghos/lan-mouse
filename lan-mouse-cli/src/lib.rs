@@ -379,6 +379,9 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                         );
                         break;
                     }
+                    TransferState::Cancelled => {
+                        return Err(CliError::Failed("cancelled".to_owned()));
+                    }
                     TransferState::Failed(e) => {
                         if interactive {
                             eprintln!();

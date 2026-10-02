@@ -365,6 +365,24 @@ and can be turned off with `clipboard = false` in the config file.
 </details>
 
 <details>
+    <summary>Sending files</summary>
+
+Drag files or folders across the edge to a paired device and let go there: they are saved in
+its Downloads folder (macOS → other devices for now; see [docs/file-transfer.md](docs/file-transfer.md)).
+From the command line:
+
+```sh
+lan-mouse cli send <device> <files or folders...>
+```
+
+Transfers use their own TLS connection between paired devices, so input stays smooth. The
+receiving device checks every name before accepting (nothing can be written outside Downloads),
+writes into a hidden staging folder, verifies the data and only then moves it into place, under
+a new name if one is taken. Symbolic links are never followed. On macOS, received files are
+marked as downloaded, so Gatekeeper still checks them.
+</details>
+
+<details>
     <summary>Command Line Interface</summary>
 
 The cli interface can be accessed by passing `cli` as a commandline argument.
