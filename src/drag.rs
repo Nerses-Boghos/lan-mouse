@@ -22,6 +22,7 @@ mod platform {
             key_down: bool,
         ) -> *mut c_void;
         fn CGEventPost(tap: u32, event: *mut c_void);
+        fn CGEventSetIntegerValueField(event: *mut c_void, field: u32, value: i64);
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -33,6 +34,7 @@ mod platform {
     const LEFT_BUTTON: u32 = 0;
     const HID_EVENT_TAP: u32 = 0;
     const KEY_ESCAPE: u16 = 53;
+    const EVENT_SOURCE_USER_DATA: u32 = 42;
 
     pub(crate) fn primary_button_down() -> bool {
         // SAFETY: plain query without pointers.
@@ -41,7 +43,9 @@ mod platform {
 
     /// End the drag on this device without dropping it here: its files were
     /// dropped on the other device, but here the drag still waits for the
-    /// button release (which went there). Escape cancels a drag.
+    /// button release (which went there). Escape cancels a drag; it is
+    /// marked so that capture passes it to this device even while the
+    /// keyboard controls the other one.
     pub(crate) fn cancel_local_drag() {
         for key_down in [true, false] {
             // SAFETY: a NULL source is allowed; the event is released after
@@ -51,6 +55,11 @@ mod platform {
                 if event.is_null() {
                     return;
                 }
+                CGEventSetIntegerValueField(
+                    event,
+                    EVENT_SOURCE_USER_DATA,
+                    input_capture::LOCAL_EVENT_MARKER,
+                );
                 CGEventPost(HID_EVENT_TAP, event);
                 CFRelease(event);
             }

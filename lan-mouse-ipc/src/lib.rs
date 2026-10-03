@@ -235,6 +235,9 @@ pub struct TransferUpdate {
     pub name: String,
     /// receiving (true) or sending
     pub incoming: bool,
+    /// carried by a drag: kept only if it ends in a drop on the receiver
+    #[serde(default)]
+    pub dragged: bool,
     pub files: usize,
     /// bytes so far, of `total`
     pub done: u64,

@@ -26,6 +26,11 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod macos_drag;
 
+/// Marks events Lan Mouse posts on this device for itself (in the event's
+/// source user data, macOS): capture lets them through to the local system
+/// instead of sending them to the device being controlled.
+pub const LOCAL_EVENT_MARKER: i64 = 0x4c4d_4f55_5345; // "LMOUSE"
+
 /// The files of a drag in progress on this device (with the left button
 /// held for it), where the platform shows them to other processes.
 #[cfg(target_os = "macos")]

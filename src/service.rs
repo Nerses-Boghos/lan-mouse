@@ -515,25 +515,19 @@ impl Service {
                     if let Some(drag) = &visit.drag {
                         log::info!("dropped the dragged files on client {handle}");
                         let _ = drag.send(Some(true));
+                        // the drag still waits here for the release that
+                        // went there: end it now, or it stays on screen
+                        drag::cancel_local_drag();
                     }
                 }
             }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
                 if let Some(visit) = self.visit.take().filter(|v| v.handle == handle) {
-                    if let Some(drag) = visit.drag {
-                        if visit.released {
-                            // dropped there; here the drag still waits for
-                            // the release that went there: cancel it, once
-                            // input flows here again
-                            tokio::task::spawn_local(async {
-                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                                drag::cancel_local_drag();
-                            });
-                        } else {
-                            // back with the button held: taken back
-                            let _ = drag.send(Some(false));
-                        }
+                    // back with the button still held: the drag is taken back
+                    // (after a drop there, it was ended when dropped)
+                    if let (Some(drag), false) = (visit.drag, visit.released) {
+                        let _ = drag.send(Some(false));
                     }
                 }
                 self.notify_frontend(FrontendEvent::Controlling(None));
@@ -891,6 +885,7 @@ impl Service {
                 fingerprint,
                 name,
                 incoming: false,
+                dragged: false,
                 files: 0,
                 done: 0,
                 total: 0,

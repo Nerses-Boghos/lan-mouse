@@ -368,6 +368,7 @@ impl Control {
         let connector = self.connector.clone();
         let authorized_keys = self.authorized_keys.clone();
         let event_tx = self.event_tx.clone();
+        let dragged = drag.is_some();
         spawn_local(async move {
             let update = |files, done, total, state| {
                 ControlEvent::Transfer(TransferUpdate {
@@ -375,6 +376,7 @@ impl Control {
                     fingerprint: fingerprint.clone(),
                     name: String::new(),
                     incoming: false,
+                    dragged,
                     files,
                     done,
                     total,
@@ -663,6 +665,7 @@ impl Handler {
                 fingerprint: fingerprint.clone(),
                 name: String::new(),
                 incoming: true,
+                dragged: header.on_drop,
                 files,
                 done,
                 total,

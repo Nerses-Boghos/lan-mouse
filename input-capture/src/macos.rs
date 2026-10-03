@@ -452,6 +452,12 @@ fn create_event_tap<'a>(
                                    event_type: CGEventType,
                                    cg_ev: &CGEvent| {
         log::trace!("Got event from tap: {event_type:?}");
+        // posted by Lan Mouse for this device itself (e.g. ending a drag)
+        if cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+            == crate::LOCAL_EVENT_MARKER
+        {
+            return CallbackResult::Keep;
+        }
         // a drag carries files only if they were written after its press
         if matches!(event_type, CGEventType::LeftMouseDown) {
             crate::macos_drag::note_press();
