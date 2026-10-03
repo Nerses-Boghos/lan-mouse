@@ -14,7 +14,7 @@
 use std::{collections::HashMap, net::IpAddr};
 
 use lan_mouse_ipc::DiscoveredPeer;
-use mdns_sd::{IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{DaemonEvent, IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
 /// Bump when the pairing / control protocol changes incompatibly.
@@ -23,6 +23,9 @@ const PROTOCOL_VERSION: &str = "4";
 pub(crate) struct Discovery {
     daemon: ServiceDaemon,
     events: Receiver<ServiceEvent>,
+    /// the daemon's own events: new addresses mean another network
+    monitor: Receiver<DaemonEvent>,
+    port: u16,
     /// what this device announces as, to announce it again (port change)
     name: String,
     host: String,
@@ -49,10 +52,13 @@ impl Discovery {
         let announced = info.get_fullname().to_owned();
         daemon.register(info)?;
         let events = daemon.browse(SERVICE_TYPE)?;
+        let monitor = daemon.monitor()?;
         log::info!("announcing this device as \"{name}\" ({host})");
         Ok(Self {
             daemon,
             events,
+            monitor,
+            port,
             name: name.to_owned(),
             host,
             announced,
@@ -64,13 +70,35 @@ impl Discovery {
     /// Waits until the set of discovered devices changes.
     pub(crate) async fn changed(&mut self) {
         loop {
-            let Ok(event) = self.events.recv_async().await else {
-                // daemon gone: never report changes again
-                return std::future::pending().await;
-            };
-            if self.apply(event) {
-                return;
+            tokio::select! {
+                event = self.events.recv_async() => {
+                    let Ok(event) = event else {
+                        // daemon gone: never report changes again
+                        return std::future::pending().await;
+                    };
+                    if self.apply(event) {
+                        return;
+                    }
+                }
+                Ok(DaemonEvent::IpAdd(ip)) = self.monitor.recv_async() => {
+                    if !(ip.is_loopback() || is_link_local(&ip)) {
+                        self.network_changed(ip);
+                    }
+                }
             }
+        }
+    }
+
+    /// This device got a new address (joined a network): announce it there
+    /// right away and look for devices again, instead of waiting for the
+    /// next scheduled query, which can be many minutes away.
+    fn network_changed(&mut self, ip: IpAddr) {
+        log::info!("new network address {ip}: announcing and looking around again");
+        self.set_port(self.port);
+        let _ = self.daemon.stop_browse(SERVICE_TYPE);
+        match self.daemon.browse(SERVICE_TYPE) {
+            Ok(events) => self.events = events,
+            Err(e) => log::warn!("could not look for devices: {e}"),
         }
     }
 
@@ -96,8 +124,9 @@ impl Discovery {
             .cloned()
     }
 
-    /// Announce this device at another port.
+    /// Announce this device at another port (or again at the same one).
     pub(crate) fn set_port(&mut self, port: u16) {
+        self.port = port;
         let _ = self.daemon.unregister(&self.announced);
         let registered = announcement(&self.name, &self.host, port, &self.own_fingerprint)
             .and_then(|info| {
@@ -177,6 +206,13 @@ impl Discovery {
             }
             _ => false,
         }
+    }
+}
+
+fn is_link_local(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_link_local(),
+        IpAddr::V6(ip) => ip.segments()[0] & 0xffc0 == 0xfe80,
     }
 }
 

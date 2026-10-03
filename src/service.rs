@@ -3,7 +3,7 @@ use crate::{
     client::ClientManager,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
-    control::{Control, ControlEvent, Layout, PairReply, PairRequest},
+    control::{Control, ControlEvent, Destination, Layout, PairReply, PairRequest},
     crypto,
     discovery::{self, Discovery},
     dns::{DnsEvent, DnsResolver},
@@ -862,17 +862,24 @@ impl Service {
             .as_ref()
             .and_then(|d| d.get(&fingerprint))
             .and_then(|p| p.ips.first().map(|&ip| SocketAddr::new(ip, p.port)));
-        let connected = || {
-            let handle = self.client_manager.find_by_fingerprint(&fingerprint)?;
-            self.client_manager.active_addr(handle)
+        let client = self.client_manager.find_by_fingerprint(&fingerprint);
+        let connected = || self.client_manager.active_addr(client?);
+        // last resort, as for input: its host name (e.g. after a network
+        // change, before it is announced again)
+        let by_name = || {
+            let (config, _) = self.client_manager.get_state(client?)?;
+            Some(Destination::Host(config.hostname?, config.port))
         };
-        let addr = announced.or_else(connected);
+        let addr = announced
+            .or_else(connected)
+            .map(Destination::Addr)
+            .or_else(by_name);
         let paired = self
             .authorized_keys
             .read()
             .expect("lock")
             .contains_key(&fingerprint);
-        let problem = match (&self.control, addr) {
+        let problem = match (&self.control, &addr) {
             _ if !paired => Some("that device isn't paired"),
             (None, _) => Some("file transfer is unavailable"),
             (_, None) => Some("the device isn't on the network"),
@@ -920,7 +927,7 @@ impl Service {
             "carrying a drag of {} items to client {handle}",
             files.len()
         );
-        control.send_files(id, addr, fingerprint, files, Some(drag));
+        control.send_files(id, Destination::Addr(addr), fingerprint, files, Some(drag));
     }
 
     /// What the user calls the device with `fingerprint`.

@@ -148,6 +148,44 @@ pub(crate) struct Layout {
     pub(crate) arranged_at: u64,
 }
 
+/// Where to reach a device.
+#[derive(Clone, Debug)]
+pub(crate) enum Destination {
+    Addr(SocketAddr),
+    /// a host name to resolve (e.g. `name.local`) and the port
+    Host(String, u16),
+}
+
+impl Destination {
+    async fn resolve(&self) -> Result<SocketAddr, String> {
+        match self {
+            Destination::Addr(addr) => Ok(*addr),
+            Destination::Host(host, port) => {
+                let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), *port))
+                    .await
+                    .map_err(|e| format!("can't find {host}: {e}"))?
+                    .collect();
+                // link-local IPv6 needs a scope this doesn't carry
+                addrs
+                    .iter()
+                    .find(|a| a.is_ipv4())
+                    .or(addrs.first())
+                    .copied()
+                    .ok_or_else(|| format!("can't find {host}"))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Destination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Destination::Addr(addr) => write!(f, "{addr}"),
+            Destination::Host(host, port) => write!(f, "{host}:{port}"),
+        }
+    }
+}
+
 pub(crate) enum ControlEvent {
     /// A device asks to pair. Answer through `reply`; dropping it declines.
     /// Accepting only trusts the device once it confirms too, see
@@ -360,7 +398,7 @@ impl Control {
     pub(crate) fn send_files(
         &self,
         id: u64,
-        addr: SocketAddr,
+        destination: Destination,
         fingerprint: String,
         paths: Vec<std::path::PathBuf>,
         drag: Option<transfer::DragOutcome>,
@@ -411,6 +449,7 @@ impl Control {
             let total: u64 = selection.entries.iter().map(|e| e.size).sum();
             let _ = event_tx.send(update(files, 0, total, TransferState::Running));
             let sending = async {
+                let addr = destination.resolve().await?;
                 let (mut tls, peer) = connect(&connector, addr).await.map_err(|e| e.to_string())?;
                 if peer != fingerprint {
                     return Err(ControlError::WrongPeer(peer).to_string());
@@ -429,15 +468,15 @@ impl Control {
             };
             let state = match sending.await {
                 Ok(true) => {
-                    log::info!("sent {files} files ({total} bytes) to {addr}");
+                    log::info!("sent {files} files ({total} bytes) to {destination}");
                     TransferState::Done { saved: vec![] }
                 }
                 Ok(false) => {
-                    log::info!("the drag to {addr} was taken back");
+                    log::info!("the drag to {destination} was taken back");
                     TransferState::Cancelled
                 }
                 Err(e) => {
-                    log::warn!("sending files to {addr} failed: {e}");
+                    log::warn!("sending files to {destination} failed: {e}");
                     TransferState::Failed(e)
                 }
             };

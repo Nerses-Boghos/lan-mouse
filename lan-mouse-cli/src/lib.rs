@@ -327,8 +327,13 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::Send { device, paths } => {
             let peers = discovered(&mut rx, &mut tx).await?;
-            let peer = find_device(&peers, &device)?;
-            let fingerprint = peer.fingerprint.clone();
+            let fingerprint = match find_device(&peers, &device) {
+                Ok(peer) => peer.fingerprint.clone(),
+                // a full fingerprint: a paired device not announced right
+                // now (the service finds it by its connection)
+                Err(_) if is_fingerprint(&device) => device.to_lowercase(),
+                Err(e) => return Err(e),
+            };
             let paths = paths
                 .iter()
                 .map(|p| {
@@ -431,6 +436,15 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+/// A complete SHA-256 fingerprint: 32 hex bytes separated by colons.
+fn is_fingerprint(text: &str) -> bool {
+    let parts: Vec<_> = text.split(':').collect();
+    parts.len() == 32
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn files_phrase(files: usize) -> String {
