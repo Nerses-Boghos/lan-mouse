@@ -21,10 +21,17 @@ use std::{
     },
 };
 
+use core_foundation::{
+    base::{CFType, TCFType},
+    dictionary::{CFDictionary, CFDictionaryRef},
+    number::CFNumber,
+    string::CFString,
+};
 use core_graphics::{
     event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField},
     event_source::{CGEventSource, CGEventSourceStateID},
     geometry::CGPoint,
+    window::{copy_window_info, kCGNullWindowID, kCGWindowListOptionOnScreenOnly},
 };
 
 type Id = *mut c_void;
@@ -60,6 +67,8 @@ extern "C" {
 static AT_PRESS: AtomicIsize = AtomicIsize::new(isize::MIN);
 /// Where the left button was last pressed.
 static PRESSED_AT: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+/// The window where the drag started, noted when it crossed.
+static DRAG_SOURCE: Mutex<Option<i64>> = Mutex::new(None);
 
 /// Runs `f` with the drag pasteboard, inside an autorelease pool (the
 /// objects involved are autoreleased, and this isn't the main thread).
@@ -106,30 +115,88 @@ pub(crate) fn note_press(location: CGPoint) {
     }
 }
 
-/// End the drag in progress here without dropping it anywhere new: release
-/// the button where the drag started, on the dragged item (the release
-/// that ends drags went to the other device). The event is marked as Lan
-/// Mouse's own, so capture lets it through to this device.
+/// End the drag in progress here without dropping it anywhere new: move it
+/// back to where it started, on the dragged item, and release it there
+/// (the release that ends drags went to the other device). Only if the
+/// window there is still the one the drag came from: otherwise the release
+/// could drop the files into another app or folder, and the drag is left
+/// for the user to put back. The events are marked as Lan Mouse's own, so
+/// capture lets them through to this device.
 pub fn end_drag_where_it_started() {
     let Some((x, y)) = PRESSED_AT.lock().ok().and_then(|at| *at) else {
         return;
     };
-    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+    let source = DRAG_SOURCE.lock().ok().and_then(|s| *s);
+    let window = window_at(x, y);
+    if source.is_none() || window != source {
+        log::warn!("not ending the drag here: the window where it started changed");
         return;
-    };
-    let Ok(release) = CGEvent::new_mouse_event(
-        source,
-        CGEventType::LeftMouseUp,
-        CGPoint::new(x, y),
-        CGMouseButton::Left,
-    ) else {
-        return;
-    };
-    release.set_integer_value_field(
-        EventField::EVENT_SOURCE_USER_DATA,
-        crate::LOCAL_EVENT_MARKER,
-    );
-    release.post(CGEventTapLocation::HID);
+    }
+    // posted with pauses, so the drag follows to the start before letting
+    // go, without holding up the caller
+    std::thread::spawn(move || {
+        let post = |kind| {
+            let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+                return;
+            };
+            if let Ok(event) =
+                CGEvent::new_mouse_event(source, kind, CGPoint::new(x, y), CGMouseButton::Left)
+            {
+                event.set_integer_value_field(
+                    EventField::EVENT_SOURCE_USER_DATA,
+                    crate::LOCAL_EVENT_MARKER,
+                );
+                event.post(CGEventTapLocation::HID);
+            }
+        };
+        for _ in 0..3 {
+            post(CGEventType::LeftMouseDragged);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        post(CGEventType::LeftMouseUp);
+    });
+}
+
+/// The frontmost ordinary window at `x`, `y` (global coordinates), by its
+/// window number: menus, the Dock and drag images (layers above 0) don't
+/// count; desktop icons (below 0) do.
+fn window_at(x: f64, y: f64) -> Option<i64> {
+    let windows = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)?;
+    for item in windows.iter() {
+        // SAFETY: the window list holds CFDictionary values; get rule keeps
+        // the array's ownership.
+        let window: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_get_rule(*item as CFDictionaryRef) };
+        let number = |dict: &CFDictionary<CFString, CFType>, key: &str| {
+            dict.find(CFString::new(key))
+                .and_then(|v| v.downcast::<CFNumber>())
+                .and_then(|n| n.to_f64())
+        };
+        if number(&window, "kCGWindowLayer").is_none_or(|layer| layer > 0.0) {
+            continue;
+        }
+        let Some(bounds) = window
+            .find(CFString::new("kCGWindowBounds"))
+            .and_then(|v| v.downcast::<CFDictionary>())
+        else {
+            continue;
+        };
+        // SAFETY: same dictionary, viewed with its key and value types
+        let bounds: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_get_rule(bounds.as_concrete_TypeRef()) };
+        let (Some(left), Some(top), Some(width), Some(height)) = (
+            number(&bounds, "X"),
+            number(&bounds, "Y"),
+            number(&bounds, "Width"),
+            number(&bounds, "Height"),
+        ) else {
+            continue;
+        };
+        if x >= left && x < left + width && y >= top && y < top + height {
+            return number(&window, "kCGWindowNumber").map(|id| id as i64);
+        }
+    }
+    None
 }
 
 /// The files being dragged right now, if the left button is held for a
@@ -169,6 +236,14 @@ pub fn current_drag() -> Option<Vec<PathBuf>> {
                 }
             }
             (!files.is_empty()).then_some(files)
+        }
+    })
+    .inspect(|_| {
+        // the drag is crossing: remember the window it started in
+        let at = PRESSED_AT.lock().ok().and_then(|at| *at);
+        let window = at.and_then(|(x, y)| window_at(x, y));
+        if let Ok(mut source) = DRAG_SOURCE.lock() {
+            *source = window;
         }
     })
 }

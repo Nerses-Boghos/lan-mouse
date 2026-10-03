@@ -139,10 +139,38 @@ jobs:
       run: scripts/makeicns.sh
     - name: Install cargo bundle
       run: cargo install cargo-bundle
+    - name: Signing identity
+      env:
+        MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+        MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      # A stable signature keeps macOS permissions across updates (see
+      # scripts/copy-macos-dylib.sh). Without the secret: ad hoc, as before.
+      run: |
+        if [ -z "$MACOS_CERT_P12" ]; then
+          echo "no signing certificate configured: signing ad hoc"
+          exit 0
+        fi
+        keychain="$RUNNER_TEMP/signing.keychain-db"
+        keychain_password="$(openssl rand -hex 16)"
+        security create-keychain -p "$keychain_password" "$keychain"
+        security set-keychain-settings -lut 3600 "$keychain"
+        security unlock-keychain -p "$keychain_password" "$keychain"
+        echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+        security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+        rm "$RUNNER_TEMP/cert.p12"
+        security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+        security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+        # the certificate's hash; a self-signed one is listed (as not
+        # trusted), and signs fine
+        identity="$(security find-identity -p codesigning "$keychain" | awk '$1 == "1)" {print $2; exit}')"
+        [ -n "$identity" ] || { echo "the certificate was not imported"; exit 1; }
+        echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+        echo "signing with $identity"
     - name: Bundle
       run: |
         cargo bundle --release
         scripts/copy-macos-dylib.sh "target/release/bundle/osx/Lan Mouse.app/Contents/MacOS/lan-mouse"
+        codesign --display --requirements - "target/release/bundle/osx/Lan Mouse.app"
     - name: Zip bundle
       run: |
         cd target/release/bundle/osx
@@ -169,10 +197,38 @@ jobs:
       run: scripts/makeicns.sh
     - name: Install cargo bundle
       run: cargo install cargo-bundle
+    - name: Signing identity
+      env:
+        MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+        MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      # A stable signature keeps macOS permissions across updates (see
+      # scripts/copy-macos-dylib.sh). Without the secret: ad hoc, as before.
+      run: |
+        if [ -z "$MACOS_CERT_P12" ]; then
+          echo "no signing certificate configured: signing ad hoc"
+          exit 0
+        fi
+        keychain="$RUNNER_TEMP/signing.keychain-db"
+        keychain_password="$(openssl rand -hex 16)"
+        security create-keychain -p "$keychain_password" "$keychain"
+        security set-keychain-settings -lut 3600 "$keychain"
+        security unlock-keychain -p "$keychain_password" "$keychain"
+        echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+        security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+        rm "$RUNNER_TEMP/cert.p12"
+        security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+        security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+        # the certificate's hash; a self-signed one is listed (as not
+        # trusted), and signs fine
+        identity="$(security find-identity -p codesigning "$keychain" | awk '$1 == "1)" {print $2; exit}')"
+        [ -n "$identity" ] || { echo "the certificate was not imported"; exit 1; }
+        echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+        echo "signing with $identity"
     - name: Bundle
       run: |
         cargo bundle --release
         scripts/copy-macos-dylib.sh "target/release/bundle/osx/Lan Mouse.app/Contents/MacOS/lan-mouse"
+        codesign --display --requirements - "target/release/bundle/osx/Lan Mouse.app"
     - name: Zip bundle
       run: |
         cd target/release/bundle/osx

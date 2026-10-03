@@ -422,7 +422,14 @@ fi
 # Everything under Frameworks was copied there by bundle_lib, so every file is
 # Mach-O nested code and needs a signature -- matching on *.dylib would leave a
 # differently named library (e.g. a .so) unsigned and the bundle seal invalid.
-find "$fwks_path" -type f -exec codesign --force --sign - {} +
-codesign --force --sign - "$bundle_path"
+#
+# MACOS_SIGN_IDENTITY names a code signing identity in the keychain; without
+# it the bundle is signed ad hoc. An ad-hoc signature changes with every
+# build, so macOS treats each build as a new app and the Accessibility and
+# Input Monitoring permissions granted to the previous one no longer apply.
+# Any stable identity (even self-signed) keeps them across updates.
+identity="${MACOS_SIGN_IDENTITY:--}"
+find "$fwks_path" -type f -exec codesign --force --sign "$identity" {} +
+codesign --force --sign "$identity" "$bundle_path"
 
 echo "Done!"
