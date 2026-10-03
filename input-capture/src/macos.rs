@@ -460,7 +460,7 @@ fn create_event_tap<'a>(
         }
         // a drag carries files only if they were written after its press
         if matches!(event_type, CGEventType::LeftMouseDown) {
-            crate::macos_drag::note_press();
+            crate::macos_drag::note_press(cg_ev.location());
         }
         let mut state = client_state.blocking_lock();
         let mut capture_position = None;

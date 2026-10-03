@@ -34,13 +34,17 @@ pub const LOCAL_EVENT_MARKER: i64 = 0x4c4d_4f55_5345; // "LMOUSE"
 /// The files of a drag in progress on this device (with the left button
 /// held for it), where the platform shows them to other processes.
 #[cfg(target_os = "macos")]
-pub use macos_drag::current_drag;
+pub use macos_drag::{current_drag, end_drag_where_it_started};
 
 /// The files of a drag in progress on this device: not readable here.
 #[cfg(not(target_os = "macos"))]
 pub fn current_drag() -> Option<Vec<std::path::PathBuf>> {
     None
 }
+
+/// End a drag carried to another device: nothing to do here.
+#[cfg(not(target_os = "macos"))]
+pub fn end_drag_where_it_started() {}
 
 #[cfg(layer_shell)]
 mod layer_shell;

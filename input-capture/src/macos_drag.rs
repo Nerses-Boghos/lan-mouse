@@ -7,11 +7,24 @@
 //! tell the current drag from an old one, its change count is noted at
 //! every left-button press: a drag carries files only if they were written
 //! after the press that is still held.
+//!
+//! The press's location is noted too: a drag dropped on another device
+//! still waits here for its button release (which went there). Releasing it
+//! where it started, on the dragged item itself, ends it without effect.
 
 use std::{
     ffi::{CStr, c_char, c_void},
     path::PathBuf,
-    sync::atomic::{AtomicIsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicIsize, Ordering},
+    },
+};
+
+use core_graphics::{
+    event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField},
+    event_source::{CGEventSource, CGEventSourceStateID},
+    geometry::CGPoint,
 };
 
 type Id = *mut c_void;
@@ -45,6 +58,8 @@ extern "C" {
 
 /// The drag pasteboard's change count at the last left-button press.
 static AT_PRESS: AtomicIsize = AtomicIsize::new(isize::MIN);
+/// Where the left button was last pressed.
+static PRESSED_AT: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
 /// Runs `f` with the drag pasteboard, inside an autorelease pool (the
 /// objects involved are autoreleased, and this isn't the main thread).
@@ -80,11 +95,41 @@ fn change_count() -> Option<isize> {
     })
 }
 
-/// Note a left-button press (cheap: one message to the pasteboard server).
-pub(crate) fn note_press() {
+/// Note a left-button press at `location` (cheap: one message to the
+/// pasteboard server).
+pub(crate) fn note_press(location: CGPoint) {
+    if let Ok(mut at) = PRESSED_AT.lock() {
+        *at = Some((location.x, location.y));
+    }
     if let Some(count) = change_count() {
         AT_PRESS.store(count, Ordering::Relaxed);
     }
+}
+
+/// End the drag in progress here without dropping it anywhere new: release
+/// the button where the drag started, on the dragged item (the release
+/// that ends drags went to the other device). The event is marked as Lan
+/// Mouse's own, so capture lets it through to this device.
+pub fn end_drag_where_it_started() {
+    let Some((x, y)) = PRESSED_AT.lock().ok().and_then(|at| *at) else {
+        return;
+    };
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        return;
+    };
+    let Ok(release) = CGEvent::new_mouse_event(
+        source,
+        CGEventType::LeftMouseUp,
+        CGPoint::new(x, y),
+        CGMouseButton::Left,
+    ) else {
+        return;
+    };
+    release.set_integer_value_field(
+        EventField::EVENT_SOURCE_USER_DATA,
+        crate::LOCAL_EVENT_MARKER,
+    );
+    release.post(CGEventTapLocation::HID);
 }
 
 /// The files being dragged right now, if the left button is held for a
