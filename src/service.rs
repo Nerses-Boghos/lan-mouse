@@ -210,6 +210,8 @@ impl Service {
             self.activate_client(handle);
         }
 
+        self.forget_untrusted_clients();
+
         // monitors come and go; other devices draw and map ours
         let mut monitor_check = tokio::time::interval(Duration::from_secs(10));
 
@@ -943,6 +945,32 @@ impl Service {
             .unwrap_or_else(|| fingerprint.chars().take(11).collect())
     }
 
+    /// Connections made by pairing whose device is no longer trusted (left
+    /// over from forgetting it before that removed both): useless, and they
+    /// hide the device from pairing again.
+    fn forget_untrusted_clients(&mut self) {
+        let untrusted: Vec<_> = {
+            let keys = self.authorized_keys.read().expect("lock");
+            self.client_manager
+                .get_client_states()
+                .into_iter()
+                .filter(|(_, c, _)| {
+                    c.fingerprint
+                        .as_ref()
+                        .is_some_and(|fp| !keys.contains_key(fp))
+                })
+                .map(|(handle, _, _)| handle)
+                .collect()
+        };
+        for &handle in &untrusted {
+            log::info!("forgetting client {handle}: its device is no longer trusted");
+            self.remove_client(handle);
+        }
+        if !untrusted.is_empty() {
+            self.save_config();
+        }
+    }
+
     /// Place client `handle` at `pos` with `offset` (see
     /// [`lan_mouse_ipc::ClientConfig::offset`]), and tell the other device,
     /// which keeps the same arrangement from its side.
@@ -1202,8 +1230,30 @@ impl Service {
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
+        // A connection to a device no longer trusted is of no use, and it
+        // would keep the device listed as paired (and not offered for
+        // pairing again): forget the device entirely. Found while it is
+        // still trusted (older connections are matched through discovery,
+        // for trusted devices only).
+        let handles: Vec<_> = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .map(|(handle, _, _)| handle)
+            .collect();
+        let forget: Vec<_> = handles
+            .into_iter()
+            .filter(|&handle| self.client_fingerprint(handle).as_deref() == Some(fp.as_str()))
+            .collect();
         self.authorized_keys.write().expect("lock").remove(&fp);
         self.emulation.disconnect(fp.clone());
+        for &handle in &forget {
+            log::info!("forgetting client {handle}: its device is no longer trusted");
+            self.remove_client(handle);
+        }
+        if !forget.is_empty() {
+            self.save_config();
+        }
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.broadcast_discovered();
