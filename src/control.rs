@@ -402,6 +402,7 @@ impl Control {
         fingerprint: String,
         paths: Vec<std::path::PathBuf>,
         drag: Option<transfer::DragOutcome>,
+        release_drops: bool,
     ) {
         let connector = self.connector.clone();
         let authorized_keys = self.authorized_keys.clone();
@@ -455,7 +456,7 @@ impl Control {
                     return Err(ControlError::WrongPeer(peer).to_string());
                 }
                 check_authorized(&peer, &authorized_keys).map_err(|e| e.to_string())?;
-                let sent = transfer::send(&mut tls, id, &selection, drag, |p| {
+                let sent = transfer::send(&mut tls, id, &selection, drag, release_drops, |p| {
                     let _ = event_tx.send(update(files, p.done, total, TransferState::Running));
                 })
                 .await;
@@ -714,7 +715,13 @@ impl Handler {
         log::info!("receiving {files} files ({total} bytes) from {addr}");
         let _ = self.event_tx.send(update(TransferState::Running, 0));
         let event_tx = self.event_tx.clone();
-        let result = transfer::receive(tls, offer, &dest, |p| {
+        // a drag from there may end here, with this device's own mouse
+        let button: Option<&dyn Fn() -> bool> = if cfg!(target_os = "macos") {
+            Some(&crate::drag::primary_button_down)
+        } else {
+            None
+        };
+        let result = transfer::receive(tls, offer, &dest, button, |p| {
             let _ = event_tx.send(update(TransferState::Running, p.done));
         })
         .await;

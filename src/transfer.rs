@@ -49,6 +49,12 @@ const KIND_CANCEL: u8 = 17;
 
 /// How long a dragged transfer waits for the user to let go.
 const DROP_WAIT: Duration = Duration::from_secs(10 * 60);
+/// A release of the receiver's button counts as the drop only if no `CANCEL`
+/// arrives within this long: taking the drag back to the sender also lets
+/// go of the receiver's button (when the receiver stops emulating input).
+const RELEASE_GRACE: Duration = Duration::from_millis(400);
+/// How often the receiver's button is looked at while a drag may end there.
+const BUTTON_POLL: Duration = Duration::from_millis(50);
 
 /// Size of the data frames.
 const CHUNK: usize = 256 * 1024;
@@ -115,6 +121,13 @@ pub(crate) struct Offer {
     /// a drag: keep the files until the sender reports the drop
     #[serde(default)]
     pub(crate) on_drop: bool,
+    /// The drag may end where the sender can't see it: on the receiver,
+    /// with its own mouse (the receiving device's mouse moved the pointer
+    /// over to the sender and back). Then a release of the receiver's
+    /// primary button counts as the drop too, unless a `CANCEL` follows
+    /// right after (see [`RELEASE_GRACE`]).
+    #[serde(default)]
+    pub(crate) release_drops: bool,
 }
 
 impl Offer {
@@ -475,12 +488,14 @@ pub(crate) async fn send<S: AsyncRead + AsyncWrite + Unpin>(
     id: u64,
     selection: &Selection,
     mut drag: Option<DragOutcome>,
+    release_drops: bool,
     progress: impl FnMut(Progress),
 ) -> Result<(), TransferError> {
     let offer = Offer {
         id,
         entries: selection.entries.clone(),
         on_drop: drag.is_some(),
+        release_drops: release_drops && drag.is_some(),
     };
     let (files, total) = (offer.files(), offer.total_bytes());
     let mut reporter = Reporter {
@@ -572,10 +587,13 @@ impl Drop for Staging {
 
 /// Receive the transfer offered in `offer` (the payload of an `OFFER` frame
 /// from a paired device) into `dest`. Returns what was saved there.
+/// `button` tells whether this device's primary button is down, for drags
+/// that may end here (see [`Offer::release_drops`]).
 pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     offer: &[u8],
     dest: &Path,
+    button: Option<&dyn Fn() -> bool>,
     progress: impl FnMut(Progress),
 ) -> Result<Vec<PathBuf>, TransferError> {
     let offer: Offer = serde_json::from_slice(offer)?;
@@ -604,13 +622,124 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
     write_frame(stream, KIND_ACCEPT, &[]).await?;
     stream.flush().await?;
 
+    // Frames are read on their own, so that waiting for the next one can
+    // be combined with watching this device's button (reading a frame
+    // can't be interrupted halfway).
+    let (mut reader, mut writer) = tokio::io::split(&mut *stream);
+    let (frames_tx, mut frames) = tokio::sync::mpsc::channel(4);
+    let read_frames = async move {
+        loop {
+            let frame = read_frame(&mut reader, CHUNK).await;
+            let failed = frame.is_err();
+            if frames_tx.send(frame).await.is_err() || failed {
+                return;
+            }
+        }
+    };
+    let mut drop = DropWatch::new(&offer, button);
+    let saved = {
+        let work = receive_frames(&offer, &staging, dest, &mut frames, &mut drop, progress);
+        tokio::pin!(read_frames, work);
+        tokio::select! {
+            biased;
+            result = &mut work => result,
+            // the connection ended: what's left in the queue decides
+            () = &mut read_frames => work.await,
+        }
+    };
+    let saved = match saved {
+        Err(e @ TransferError::Corrupted) => {
+            refuse(&mut writer, &e).await;
+            return Err(e);
+        }
+        result => result?,
+    };
+    write_frame(&mut writer, KIND_DONE, &[]).await?;
+    writer.flush().await?;
+    Ok(saved)
+}
+
+/// Whether a dragged transfer was dropped here: by the sender's `DROP`, or
+/// (with `release_drops`) by this device's button going up, unless the
+/// sender cancels within [`RELEASE_GRACE`].
+struct DropWatch<'a> {
+    dropped: bool,
+    button: Option<&'a dyn Fn() -> bool>,
+    was_down: bool,
+    released: Option<Instant>,
+}
+
+impl<'a> DropWatch<'a> {
+    fn new(offer: &Offer, button: Option<&'a dyn Fn() -> bool>) -> Self {
+        let button = button.filter(|_| offer.on_drop && offer.release_drops);
+        let was_down = button.is_some_and(|down| down());
+        Self {
+            // not a drag: always wanted
+            dropped: !offer.on_drop,
+            button,
+            was_down,
+            // already up when the files arrived: let go right away
+            released: button.filter(|_| !was_down).map(|_| Instant::now()),
+        }
+    }
+
+    fn watch_button(&mut self) {
+        let Some(down) = self.button.map(|down| down()) else {
+            return;
+        };
+        if self.was_down && !down && self.released.is_none() {
+            self.released = Some(Instant::now());
+        }
+        self.was_down = down;
+    }
+
+    fn decided(&mut self) -> bool {
+        self.watch_button();
+        if self
+            .released
+            .is_some_and(|at| at.elapsed() >= RELEASE_GRACE)
+        {
+            self.dropped = true;
+        }
+        self.dropped
+    }
+}
+
+type Frames = tokio::sync::mpsc::Receiver<Result<(u8, Vec<u8>), TransferError>>;
+
+/// The next data frame (or the end), taking note of `DROP` and stopping at
+/// `CANCEL` in between.
+async fn next_frame(
+    frames: &mut Frames,
+    drop: &mut DropWatch<'_>,
+) -> Result<(u8, Vec<u8>), TransferError> {
+    loop {
+        let frame = tokio::time::timeout(STALL, frames.recv())
+            .await
+            .map_err(|_| TransferError::Stalled)?
+            .ok_or(TransferError::Stalled)??;
+        drop.watch_button();
+        match frame {
+            (KIND_DROP, _) => drop.dropped = true,
+            (KIND_CANCEL, _) => return Err(TransferError::Cancelled),
+            frame => return Ok(frame),
+        }
+    }
+}
+
+async fn receive_frames(
+    offer: &Offer,
+    staging: &Staging,
+    dest: &Path,
+    frames: &mut Frames,
+    drop: &mut DropWatch<'_>,
+    progress: impl FnMut(Progress),
+) -> Result<Vec<PathBuf>, TransferError> {
     let (files, total) = (offer.files(), offer.total_bytes());
     let mut reporter = Reporter {
         report: progress,
         last: None,
     };
-    // whether the files are wanted: always, unless they come with a drag
-    let mut dropped = !offer.on_drop;
     let mut hash = Sha256::new();
     let mut done = 0u64;
     // data from the current chunk not written yet
@@ -637,13 +766,9 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
         let mut left = entry.size;
         while left > 0 {
             if pending_at == pending.len() {
-                pending = loop {
-                    match stalling(read_frame(stream, CHUNK)).await? {
-                        (KIND_CHUNK, data) if !data.is_empty() => break data,
-                        (KIND_DROP, _) => dropped = true,
-                        (KIND_CANCEL, _) => return Err(TransferError::Cancelled),
-                        (kind, _) => return Err(TransferError::UnexpectedKind(kind)),
-                    }
+                pending = match next_frame(frames, drop).await? {
+                    (KIND_CHUNK, data) if !data.is_empty() => data,
+                    (kind, _) => return Err(TransferError::UnexpectedKind(kind)),
                 };
                 pending_at = 0;
             }
@@ -665,40 +790,40 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
             );
         }
         file.sync_all().await?;
-        drop(file);
+        std::mem::drop(file);
         fs::rename(&part, &path)?;
         mark_downloaded(&path);
     }
     if pending_at != pending.len() {
         // more data than announced
-        let e = TransferError::Corrupted;
-        refuse(stream, &e).await;
-        return Err(e);
+        return Err(TransferError::Corrupted);
     }
-    let digest = loop {
-        match stalling(read_frame(stream, 64)).await? {
-            (KIND_END, digest) => break digest,
-            (KIND_DROP, _) => dropped = true,
-            (KIND_CANCEL, _) => return Err(TransferError::Cancelled),
-            (kind, _) => return Err(TransferError::UnexpectedKind(kind)),
-        }
+    let digest = match next_frame(frames, drop).await? {
+        (KIND_END, digest) => digest,
+        (kind, _) => return Err(TransferError::UnexpectedKind(kind)),
     };
     let ours: [u8; 32] = hash.finalize().into();
     if digest.as_slice() != ours.as_slice() {
-        let e = TransferError::Corrupted;
-        refuse(stream, &e).await;
-        return Err(e);
+        return Err(TransferError::Corrupted);
     }
 
     // complete; a drag must still end in a drop here
-    if !dropped {
-        let outcome = tokio::time::timeout(DROP_WAIT, read_frame(stream, 64))
-            .await
-            .map_err(|_| TransferError::Cancelled)??;
-        match outcome {
-            (KIND_DROP, _) => {}
-            (KIND_CANCEL, _) => return Err(TransferError::Cancelled),
-            (kind, _) => return Err(TransferError::UnexpectedKind(kind)),
+    let deadline = Instant::now() + DROP_WAIT;
+    while !drop.decided() {
+        if Instant::now() > deadline {
+            return Err(TransferError::Cancelled);
+        }
+        let poll = drop.button.is_some();
+        tokio::select! {
+            frame = frames.recv() => match frame {
+                Some(Ok((KIND_DROP, _))) => drop.dropped = true,
+                Some(Ok((KIND_CANCEL, _))) => return Err(TransferError::Cancelled),
+                Some(Ok((kind, _))) => return Err(TransferError::UnexpectedKind(kind)),
+                Some(Err(e)) => return Err(e),
+                // the sender is gone before the user let go
+                None => return Err(TransferError::Cancelled),
+            },
+            () = tokio::time::sleep(BUTTON_POLL), if poll => {}
         }
     }
 
@@ -713,8 +838,6 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
             saved.push(target);
         }
     }
-    write_frame(stream, KIND_DONE, &[]).await?;
-    stream.flush().await?;
     reporter.progress(
         Progress {
             id: offer.id,
@@ -813,6 +936,7 @@ mod tests {
             id: 1,
             entries: vec![entry("a"), entry("a")],
             on_drop: false,
+            release_drops: false,
         };
         assert!(check_offer(&offer).is_err());
     }
@@ -849,11 +973,11 @@ mod tests {
     async fn transfer(paths: &[PathBuf], dest: &Path) -> Result<Vec<PathBuf>, TransferError> {
         let selection = select(paths)?;
         let (mut a, mut b) = duplex(64 * 1024);
-        let sender = async { send(&mut a, 7, &selection, None, |_| {}).await };
+        let sender = async { send(&mut a, 7, &selection, None, false, |_| {}).await };
         let receiver = async {
             let (kind, offer) = read_frame(&mut b, MAX_OFFER_SIZE).await?;
             assert_eq!(kind, KIND_OFFER);
-            receive(&mut b, &offer, dest, |_| {}).await
+            receive(&mut b, &offer, dest, None, |_| {}).await
         };
         let (sent, received) = tokio::join!(sender, receiver);
         sent?;
@@ -908,6 +1032,7 @@ mod tests {
                 id: 9,
                 entries: selection.entries.clone(),
                 on_drop: false,
+                release_drops: false,
             };
             write_frame(&mut a, KIND_OFFER, &serde_json::to_vec(&offer).unwrap())
                 .await
@@ -920,7 +1045,7 @@ mod tests {
         };
         let receiver = async {
             let (_, offer) = read_frame(&mut b, MAX_OFFER_SIZE).await.unwrap();
-            receive(&mut b, &offer, &dest, |_| {}).await
+            receive(&mut b, &offer, &dest, None, |_| {}).await
         };
         let ((), received) = tokio::join!(sender, receiver);
         assert!(received.is_err());
@@ -937,6 +1062,7 @@ mod tests {
             let offer = Offer {
                 id: 3,
                 on_drop: false,
+                release_drops: false,
                 entries: vec![Entry {
                     path: "a.txt".to_owned(),
                     kind: EntryKind::File,
@@ -955,7 +1081,7 @@ mod tests {
         };
         let receiver = async {
             let (_, offer) = read_frame(&mut b, MAX_OFFER_SIZE).await.unwrap();
-            receive(&mut b, &offer, &dest, |_| {}).await
+            receive(&mut b, &offer, &dest, None, |_| {}).await
         };
         let (answer, received) = tokio::join!(sender, receiver);
         assert_eq!(answer, KIND_REFUSE);
@@ -972,6 +1098,7 @@ mod tests {
         let offer = Offer {
             id: 4,
             on_drop: false,
+            release_drops: false,
             entries: vec![Entry {
                 path: "../outside.txt".to_owned(),
                 kind: EntryKind::File,
@@ -979,7 +1106,7 @@ mod tests {
             }],
         };
         let payload = serde_json::to_vec(&offer).unwrap();
-        let receiver = receive(&mut b, &payload, &dest, |_| {});
+        let receiver = receive(&mut b, &payload, &dest, None, |_| {});
         let (received, answer) = tokio::join!(receiver, read_frame(&mut a, 1024));
         assert!(matches!(received, Err(TransferError::UnsafeName(_))));
         assert_eq!(answer.unwrap().0, KIND_REFUSE);
@@ -998,14 +1125,14 @@ mod tests {
         let selection = select(&[src.to_owned()])?;
         let (tx, rx) = tokio::sync::watch::channel(None);
         let (mut a, mut b) = duplex(64 * 1024);
-        let sender = async { send(&mut a, 11, &selection, Some(rx), |_| {}).await };
+        let sender = async { send(&mut a, 11, &selection, Some(rx), false, |_| {}).await };
         let user = async {
             tokio::time::sleep(delay).await;
             tx.send(Some(outcome)).unwrap();
         };
         let receiver = async {
             let (_, offer) = read_frame(&mut b, MAX_OFFER_SIZE).await?;
-            receive(&mut b, &offer, dest, |_| {}).await
+            receive(&mut b, &offer, dest, None, |_| {}).await
         };
         let (sent, (), received) = tokio::join!(sender, user, receiver);
         if outcome {
@@ -1045,6 +1172,71 @@ mod tests {
             );
             assert_eq!(fs::read_dir(&dest).unwrap().count(), 0, "leftovers");
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A drag from the sender, ended on the receiver with its own mouse:
+    /// the receiver's button goes up after `release`, and the sender cancels
+    /// after `cancel` (if at all).
+    async fn drag_ended_here(
+        dest: &Path,
+        release: Duration,
+        cancel: Option<Duration>,
+    ) -> Result<Vec<PathBuf>, TransferError> {
+        let dir = dest.parent().unwrap();
+        let src = dir.join("note.txt");
+        fs::write(&src, "hi").unwrap();
+        let selection = select(&[src])?;
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let (mut a, mut b) = duplex(64 * 1024);
+        let down = std::sync::atomic::AtomicBool::new(true);
+        let button = || down.load(std::sync::atomic::Ordering::Relaxed);
+        let sender = async { send(&mut a, 12, &selection, Some(rx), true, |_| {}).await };
+        let user = async {
+            tokio::time::sleep(release).await;
+            down.store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(cancel) = cancel {
+                tokio::time::sleep(cancel).await;
+                let _ = tx.send(Some(false));
+            } else {
+                // the sender never learns how it ended
+                std::mem::forget(tx);
+            }
+        };
+        let receiver = async {
+            let (_, offer) = read_frame(&mut b, MAX_OFFER_SIZE).await?;
+            receive(&mut b, &offer, dest, Some(&button), |_| {}).await
+        };
+        let (_, (), received) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), sender),
+            user,
+            receiver
+        );
+        received
+    }
+
+    #[tokio::test]
+    async fn a_drag_can_end_with_the_receivers_own_mouse() {
+        let dir = temp_dir("released-here");
+        let dest = dir.join("Downloads");
+        // let go here: dropped
+        let saved = drag_ended_here(&dest, Duration::from_millis(100), None)
+            .await
+            .unwrap();
+        assert_eq!(saved, [dest.join("note.txt")]);
+        // the button went up because the drag went back: cancelled
+        let back = drag_ended_here(
+            &dest,
+            Duration::from_millis(100),
+            Some(Duration::from_millis(50)),
+        )
+        .await;
+        assert!(matches!(back, Err(TransferError::Cancelled)), "{back:?}");
+        assert_eq!(
+            fs::read_dir(&dest).unwrap().count(),
+            1,
+            "only the first one"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

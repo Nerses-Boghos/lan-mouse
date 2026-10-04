@@ -36,11 +36,27 @@ pub const LOCAL_EVENT_MARKER: i64 = 0x4c4d_4f55_5345; // "LMOUSE"
 #[cfg(target_os = "macos")]
 pub use macos_drag::{current_drag, end_drag_where_it_started};
 
+#[cfg(layer_shell)]
+mod wayland_drag;
+
+/// The files of a drag that reached an edge to another device (Wayland).
+#[cfg(layer_shell)]
+pub use wayland_drag::current_drag;
+
 /// The files of a drag in progress on this device: not readable here.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", layer_shell)))]
 pub fn current_drag() -> Option<Vec<std::path::PathBuf>> {
     None
 }
+
+/// Watch these screen edges (where other devices are) for dragged files.
+#[cfg(layer_shell)]
+pub use wayland_drag::watch_edges as watch_drag_edges;
+
+/// Watch these screen edges for dragged files: not needed (macOS reads the
+/// drag pasteboard) or not possible here.
+#[cfg(not(layer_shell))]
+pub fn watch_drag_edges(_edges: Vec<Position>) {}
 
 /// End a drag carried to another device: nothing to do here.
 #[cfg(not(target_os = "macos"))]

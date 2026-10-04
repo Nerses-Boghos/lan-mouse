@@ -368,7 +368,9 @@ and can be turned off with `clipboard = false` in the config file.
     <summary>Sending files</summary>
 
 Drag files or folders across the edge to a paired device and let go there: they are saved in
-its Downloads folder (macOS → other devices for now; see [docs/file-transfer.md](docs/file-transfer.md)).
+its Downloads folder (macOS and Wayland/wlroots; see [docs/file-transfer.md](docs/file-transfer.md)).
+On Wayland, an invisible one-pixel strip along each edge leading to another device learns which
+files a drag carries (the compositor shows a drag only to the surface under the pointer).
 From the command line:
 
 ```sh

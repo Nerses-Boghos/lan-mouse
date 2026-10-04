@@ -906,7 +906,7 @@ impl Service {
             return;
         };
         log::info!("sending {} items to {addr}", paths.len());
-        control.send_files(id, addr, fingerprint, paths, None);
+        control.send_files(id, addr, fingerprint, paths, None, false);
     }
 
     /// Start sending the files of a drag that just crossed to client
@@ -929,7 +929,17 @@ impl Service {
             "carrying a drag of {} items to client {handle}",
             files.len()
         );
-        control.send_files(id, Destination::Addr(addr), fingerprint, files, Some(drag));
+        // on this platform, can the drag end on the receiver with its own
+        // mouse? (Linux: yes, when that mouse controls this device)
+        let release_drops = cfg!(not(target_os = "macos"));
+        control.send_files(
+            id,
+            Destination::Addr(addr),
+            fingerprint,
+            files,
+            Some(drag),
+            release_drops,
+        );
     }
 
     /// What the user calls the device with `fingerprint`.
@@ -1285,7 +1295,26 @@ impl Service {
             self.capture.destroy(handle);
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
+            self.watch_drag_edges();
         }
+    }
+
+    /// Watch the edges that lead to other devices for files dragged there
+    /// (Wayland shows a drag only to the surface under the pointer).
+    fn watch_drag_edges(&self) {
+        let edges = self
+            .client_manager
+            .active_clients()
+            .into_iter()
+            .filter_map(|handle| self.client_manager.get_pos(handle))
+            .map(|pos| match pos {
+                Position::Left => input_capture::Position::Left,
+                Position::Right => input_capture::Position::Right,
+                Position::Top => input_capture::Position::Top,
+                Position::Bottom => input_capture::Position::Bottom,
+            })
+            .collect();
+        input_capture::watch_drag_edges(edges);
     }
 
     fn activate_client(&mut self, handle: ClientHandle) {
@@ -1311,6 +1340,7 @@ impl Service {
             self.capture.create(handle, pos, CaptureType::Default);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
+            self.watch_drag_edges();
         }
     }
 
@@ -1330,6 +1360,7 @@ impl Service {
             .unwrap_or(false)
         {
             self.capture.destroy(handle);
+            self.watch_drag_edges();
         }
         self.notify_frontend(FrontendEvent::Deleted(handle));
     }

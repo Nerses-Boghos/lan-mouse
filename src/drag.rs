@@ -1,10 +1,10 @@
 //! Files the user is dragging on this device, so a drag can carry them across
 //! to another device (see `docs/file-transfer.md`).
 //!
-//! Only macOS so far: its drag pasteboard is readable by any process (see
-//! `input_capture::current_drag`). On
-//! Wayland, the compositor shows a drag only to the surface under the
-//! pointer; reading it needs a surface of our own at the edge (not done yet).
+//! macOS: its drag pasteboard is readable by any process. Wayland: the
+//! compositor shows a drag only to the surface under the pointer, so
+//! invisible strips along the edges to other devices read it (see
+//! `input_capture::current_drag`).
 
 use std::path::PathBuf;
 
@@ -45,7 +45,9 @@ pub(crate) fn cancel_local_drag() {
 /// The files being dragged across right now, if the left button is held
 /// for a drag that carries files.
 pub(crate) fn dragged_files() -> Option<Vec<PathBuf>> {
-    if !primary_button_down() {
+    // macOS keeps the last drag's files: only a held button means a drag
+    // now (Wayland only reports drags in progress at the edge)
+    if cfg!(target_os = "macos") && !primary_button_down() {
         return None;
     }
     let files = input_capture::current_drag();
