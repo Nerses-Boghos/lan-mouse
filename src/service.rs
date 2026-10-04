@@ -94,6 +94,10 @@ pub struct Service {
     monitors: Vec<Monitor>,
     /// the current visit to another device, for drags carried there
     visit: Option<Visit>,
+    /// files of a drag that crossed before they were known, see
+    /// [`Service::wait_for_dragged_files`]
+    late_drag_tx: local_channel::mpsc::Sender<(ClientHandle, Vec<std::path::PathBuf>)>,
+    late_drag_rx: local_channel::mpsc::Receiver<(ClientHandle, Vec<std::path::PathBuf>)>,
 }
 
 /// While the keyboard and mouse control another device: a file drag
@@ -167,6 +171,7 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+        let (late_drag_tx, late_drag_rx) = local_channel::mpsc::channel();
         let service = Self {
             config,
             capture,
@@ -193,6 +198,8 @@ impl Service {
             layout_sent: Default::default(),
             monitors: local_monitors(),
             visit: None,
+            late_drag_tx,
+            late_drag_rx,
         };
         Ok(service)
     }
@@ -229,6 +236,14 @@ impl Service {
                     }
                 }
                 _ = monitor_check.tick() => self.check_monitors(),
+                Some((handle, files)) = self.late_drag_rx.recv() => {
+                    // still on that visit, and not dropped already
+                    let carrying = self.visit.as_ref()
+                        .is_some_and(|v| v.handle == handle && !v.released && v.drag.is_none());
+                    if carrying {
+                        self.carry_drag(handle, files);
+                    }
+                }
                 event = next_control_event(&mut self.control) => self.handle_control_event(event),
                 _ = discovery_changed(&mut self.discovery) => {
                     self.update_announced_ips();
@@ -502,6 +517,8 @@ impl Service {
                 });
                 if let Some(files) = drag::dragged_files() {
                     self.carry_drag(handle, files);
+                } else if input_capture::drag_pending() {
+                    self.wait_for_dragged_files(handle);
                 }
                 self.notify_frontend(FrontendEvent::Controlling(Some(handle)));
                 self.spawn_hook_command(handle, HookKind::Enter);
@@ -917,6 +934,26 @@ impl Service {
         };
         log::info!("sending {} items to {addr}", paths.len());
         control.send_files(id, addr, fingerprint, paths, None, false);
+    }
+
+    /// A drag crossed to client `handle` while its files were still being
+    /// read from its source (a quick crossing): carry it once they are
+    /// known, if that is soon.
+    fn wait_for_dragged_files(&self, handle: ClientHandle) {
+        let found = self.late_drag_tx.clone();
+        tokio::task::spawn_local(async move {
+            for _ in 0..8 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if let Some(files) = input_capture::current_drag() {
+                    let _ = found.send((handle, files));
+                    return;
+                }
+                if !input_capture::drag_pending() {
+                    return;
+                }
+            }
+            log::info!("the dragged files didn't arrive in time");
+        });
     }
 
     /// Start sending the files of a drag that just crossed to client

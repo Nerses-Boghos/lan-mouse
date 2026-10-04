@@ -60,22 +60,40 @@ const URI_LIST: &str = "text/uri-list";
 /// back) still counts for this long.
 const REMEMBER: Duration = Duration::from_secs(3);
 
-/// The last file drag seen at an edge.
+/// The last drag seen at an edge.
 struct Seen {
-    files: Vec<PathBuf>,
+    /// counts drags, so a slow read can't update a later one
+    generation: u64,
+    /// the dragged files, once read (`None` while reading, or not files)
+    files: Option<Vec<PathBuf>>,
+    /// still reading the files from the drag's source
+    reading: bool,
     /// when the drag left the strip; `None` while it is on it
     left: Option<Instant>,
 }
 
-static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
+static SEEN: Mutex<Seen> = Mutex::new(Seen {
+    generation: 0,
+    files: None,
+    reading: false,
+    left: None,
+});
 static EDGES: OnceLock<Mutex<Sender<Vec<Position>>>> = OnceLock::new();
 
 /// The files of a drag at (or just through) an edge to another device.
 pub fn current_drag() -> Option<Vec<PathBuf>> {
     let seen = SEEN.lock().ok()?;
-    let seen = seen.as_ref()?;
     let recent = seen.left.is_none_or(|left| left.elapsed() < REMEMBER);
-    (recent && !seen.files.is_empty()).then(|| seen.files.clone())
+    seen.files
+        .clone()
+        .filter(|files| recent && !files.is_empty())
+}
+
+/// Whether a drag of files is at (or just through) an edge, but its files
+/// are still being read from its source (a fast crossing can be quicker).
+pub fn drag_pending() -> bool {
+    SEEN.lock()
+        .is_ok_and(|seen| seen.reading && seen.left.is_none_or(|left| left.elapsed() < REMEMBER))
 }
 
 /// Watch the screen edges at `edges` (the sides other devices are on) for
@@ -328,8 +346,21 @@ impl State {
         Some(buffer)
     }
 
+    /// A drag entered a strip: forget the previous one.
+    fn new_drag(&self, reading: bool) -> u64 {
+        let Ok(mut seen) = SEEN.lock() else {
+            return 0;
+        };
+        seen.generation += 1;
+        seen.files = None;
+        seen.reading = reading;
+        seen.left = None;
+        seen.generation
+    }
+
     /// Read the dragged files from `offer` in the background.
     fn read_files(&self, offer: &WlDataOffer) {
+        let generation = self.new_drag(true);
         let mut fds = [0; 2];
         // SAFETY: a valid array for the two descriptors
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -345,9 +376,13 @@ impl State {
             let mut list = String::new();
             if File::from(read).read_to_string(&mut list).is_ok() {
                 let files = parse_uri_list(&list);
-                log::debug!("dragged to an edge: {files:?}");
+                log::info!("files dragged to the edge: {}", files.len());
                 if let Ok(mut seen) = SEEN.lock() {
-                    *seen = Some(Seen { files, left: None });
+                    // still the same drag (the read may outlast it)
+                    if seen.generation == generation {
+                        seen.files = Some(files);
+                        seen.reading = false;
+                    }
                 }
             }
         });
@@ -355,9 +390,7 @@ impl State {
 
     fn forget_drag_soon(&mut self) {
         if let Ok(mut seen) = SEEN.lock() {
-            if let Some(seen) = seen.as_mut() {
-                seen.left.get_or_insert_with(Instant::now);
-            }
+            seen.left.get_or_insert_with(Instant::now);
         }
     }
 }
@@ -386,6 +419,7 @@ impl Dispatch<WlDataDevice, ()> for State {
                     .offers
                     .get(&offer.id())
                     .is_some_and(|mimes| mimes.iter().any(|m| m == URI_LIST));
+                log::info!("a drag reached the edge (files: {files})");
                 if files {
                     offer.accept(serial, Some(URI_LIST.into()));
                     // a copy, never a move: dropping here must not take the
@@ -396,6 +430,7 @@ impl Dispatch<WlDataDevice, ()> for State {
                     state.read_files(&offer);
                     state.dragging = Some(offer);
                 } else {
+                    state.new_drag(false);
                     offer.accept(serial, None);
                 }
             }

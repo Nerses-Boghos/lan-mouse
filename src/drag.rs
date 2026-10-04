@@ -51,9 +51,8 @@ pub(crate) fn dragged_files() -> Option<Vec<PathBuf>> {
         return None;
     }
     let files = input_capture::current_drag();
-    match &files {
-        Some(files) => log::info!("crossed while dragging {} items", files.len()),
-        None => log::info!("crossed while dragging something other than files"),
+    if let Some(files) = &files {
+        log::info!("crossed while dragging {} items", files.len());
     }
     files
 }

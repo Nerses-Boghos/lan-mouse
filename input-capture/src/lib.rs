@@ -41,7 +41,13 @@ mod wayland_drag;
 
 /// The files of a drag that reached an edge to another device (Wayland).
 #[cfg(layer_shell)]
-pub use wayland_drag::current_drag;
+pub use wayland_drag::{current_drag, drag_pending};
+
+/// Whether a dragged file list is still on its way: never here.
+#[cfg(not(layer_shell))]
+pub fn drag_pending() -> bool {
+    false
+}
 
 /// The files of a drag in progress on this device: not readable here.
 #[cfg(not(any(target_os = "macos", layer_shell)))]
