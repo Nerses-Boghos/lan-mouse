@@ -208,14 +208,6 @@ impl InputCapture {
         self.capture.release().await
     }
 
-    /// release the mouse `slide` pixels along the edge from where it was
-    /// captured
-    pub async fn release_sliding(&mut self, slide: f64) -> Result<(), CaptureError> {
-        self.pressed_keys.clear();
-        self.capture.set_release_slide(slide);
-        self.capture.release().await
-    }
-
     /// Drain and return every key the capture has forwarded as
     /// down-but-not-up. The caller is expected to synthesize key-up
     /// events to the remote peer for each — otherwise the peer
@@ -345,13 +337,6 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
-
-    /// Have the next release put the mouse `slide` pixels along the edge
-    /// from where it was captured (it moved along the edge while captured).
-    /// Backends that can't place it ignore this.
-    fn set_release_slide(&mut self, slide: f64) {
-        let _ = slide;
-    }
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;

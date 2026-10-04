@@ -76,12 +76,10 @@ enum LibeiNotifyEvent {
     Destroy(Position),
 }
 
-/// Asks the capture session to release the pointer, optionally moved along
-/// the edge (see [`LanMouseInputCapture::set_release_slide`]).
+/// Asks the capture session to release the pointer.
 #[derive(Default)]
 struct ReleaseRequest {
     notify: Notify,
-    slide: std::sync::Mutex<f64>,
 }
 
 #[allow(dead_code)]
@@ -471,8 +469,7 @@ async fn do_capture_session(
                         },
                     }
 
-                    let slide = std::mem::take(&mut *notify_release.slide.lock().expect("lock"));
-                    release_capture(input_capture, session, activated, pos, slide).await?;
+                    release_capture(input_capture, session, activated, pos).await?;
 
                 }
                 _ = notify_release.notify.notified() => { /* capture release -> we are not capturing anyway, so ignore */
@@ -516,7 +513,6 @@ async fn release_capture(
     session: &Session<InputCapture>,
     activated: Activated,
     current_pos: Position,
-    slide: f64,
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
@@ -532,12 +528,8 @@ async fn release_capture(
         Position::Top => (0., 1.),
         Position::Bottom => (0., -1.),
     };
-    // release 1px inside the entered zone, where it slid to along the edge
-    let (sx, sy) = match current_pos {
-        Position::Left | Position::Right => (0., slide),
-        Position::Top | Position::Bottom => (slide, 0.),
-    };
-    let cursor_position = (x as f64 + dx + sx, y as f64 + dy + sy);
+    // release 1px inside the entered zone
+    let cursor_position = (x as f64 + dx, y as f64 + dy);
     let release_options = ReleaseOptions::default()
         .set_activation_id(activated.activation_id())
         .set_cursor_position(Some(cursor_position));
@@ -667,10 +659,6 @@ impl LanMouseInputCapture for LibeiInputCapture {
     async fn release(&mut self) -> Result<(), CaptureError> {
         self.notify_release.notify.notify_waiters();
         Ok(())
-    }
-
-    fn set_release_slide(&mut self, slide: f64) {
-        *self.notify_release.slide.lock().expect("lock") = slide;
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
