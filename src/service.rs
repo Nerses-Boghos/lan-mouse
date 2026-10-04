@@ -642,6 +642,16 @@ impl Service {
             } => self.apply_layout(&fingerprint, layout),
             ControlEvent::Transfer(mut update) => {
                 update.name = self.device_name(&update.fingerprint);
+                // Files dragged from here were dropped over there: a drag
+                // carried by the other device's mouse still waits here for
+                // its button release (emulated here, but the release
+                // happened over there). Let go of it, on the edge strip.
+                let dropped_there = !update.incoming
+                    && update.dragged
+                    && matches!(update.state, TransferState::Done { .. });
+                if dropped_there && cfg!(not(target_os = "macos")) {
+                    self.emulation.release_primary();
+                }
                 self.notify_frontend(FrontendEvent::Transfer(update));
             }
             ControlEvent::Finished {

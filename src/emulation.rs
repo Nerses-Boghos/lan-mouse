@@ -2,7 +2,7 @@ use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
-use input_event::Event;
+use input_event::{Event, PointerEvent};
 use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -69,6 +69,9 @@ pub(crate) enum EmulationEvent {
 enum EmulationRequest {
     Reenable,
     Release(SocketAddr),
+    /// let go of the primary button held for any device (see
+    /// [`Emulation::release_primary`])
+    ReleasePrimary,
     /// drop the connections of a device that is no longer authorized
     Disconnect(String),
     ChangePort(u16),
@@ -104,6 +107,15 @@ impl Emulation {
     }
 
     /// End all connections from the device with `fingerprint`.
+    /// Let go of the primary button that devices controlling this one hold
+    /// down: a drag they carried away and dropped elsewhere still waits here
+    /// for its release (it ends on the edge strip, as a copy).
+    pub(crate) fn release_primary(&self) {
+        self.request_tx
+            .send(EmulationRequest::ReleasePrimary)
+            .expect("channel closed");
+    }
+
     pub(crate) fn disconnect(&self, fingerprint: String) {
         self.request_tx
             .send(EmulationRequest::Disconnect(fingerprint))
@@ -236,6 +248,7 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::ReleasePrimary => self.emulation_proxy.release_primary(),
                     EmulationRequest::Disconnect(fingerprint) => {
                         for addr in self.listener.disconnect(&fingerprint).await {
                             log::info!("disconnected {addr}: no longer authorized");
@@ -285,6 +298,7 @@ enum ProxyRequest {
     Input(Event, SocketAddr),
     Warp(f64, f64, SocketAddr),
     Remove(SocketAddr),
+    ReleasePrimary,
     Terminate,
     Reenable,
 }
@@ -347,6 +361,14 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    fn release_primary(&self) {
+        if self.emulation_active.get() {
+            self.request_tx
+                .send(ProxyRequest::ReleasePrimary)
+                .expect("channel closed");
+        }
+    }
+
     fn reenable(&self) {
         self.request_tx
             .send(ProxyRequest::Reenable)
@@ -387,7 +409,8 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) | ProxyRequest::Warp(..) => { /* emulation inactive => ignore */
                     }
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Remove(..) | ProxyRequest::ReleasePrimary => { /* emulation inactive => ignore */
+                    }
                 }
             }
         }
@@ -466,6 +489,16 @@ impl EmulationTask {
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
+                        }
+                    }
+                    ProxyRequest::ReleasePrimary => {
+                        let release = Event::Pointer(PointerEvent::Button {
+                            time: 0,
+                            button: input_event::BTN_LEFT,
+                            state: 0,
+                        });
+                        for &handle in self.handles.values() {
+                            emulation.consume(release, handle).await?;
                         }
                     }
                     ProxyRequest::Terminate => break Ok(()),
@@ -657,6 +690,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Warp(..) => continue,
             ProxyRequest::Remove(_) => continue,
+            ProxyRequest::ReleasePrimary => continue,
             ProxyRequest::Reenable => continue,
         }
     }
