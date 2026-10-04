@@ -97,6 +97,8 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            held: Vec::new(),
+            visit_keys: KeyCounts::default(),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -179,8 +181,24 @@ fn retry_cooldown(failures: u32) -> Duration {
     Duration::from_millis(500 << failures.saturating_sub(1).min(4)).min(Duration::from_secs(5))
 }
 
+/// Keys of a visit to a client, counted (never logged themselves).
+#[derive(Default)]
+struct KeyCounts {
+    forwarded: usize,
+    held: usize,
+}
+
+/// Input held back until a client acknowledges the crossing, at most this
+/// much (keys and buttons are kept, pointer motion isn't).
+const MAX_HELD: usize = 512;
+
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
+    /// keys, buttons and scrolling while the client hasn't acknowledged the
+    /// crossing yet: sent once it has (typing right after crossing used to
+    /// be lost)
+    held: Vec<Event>,
+    visit_keys: KeyCounts,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -335,8 +353,17 @@ impl CaptureTask {
                     match event {
                         // connection acknowlegded => set state to Sending
                         ProtoEvent::Ack(_) => {
-                            log::info!("client {handle} acknowledged the connection!");
+                            if self.state == State::WaitingForAck {
+                                log::info!("client {handle} acknowledged the connection!");
+                            }
                             self.state = State::Sending;
+                            // what was typed and clicked while it got there
+                            for event in std::mem::take(&mut self.held) {
+                                if let Err(e) = self.conn.send(ProtoEvent::Input(event), handle).await {
+                                    log::warn!("could not send held input to client {handle}: {e}");
+                                    break;
+                                }
+                            }
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
@@ -456,11 +483,24 @@ impl CaptureTask {
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
+        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { .. })) = event {
+            match self.state {
+                State::WaitingForAck => self.visit_keys.held += 1,
+                State::Sending => self.visit_keys.forwarded += 1,
+            }
+        }
         let event = match event {
             CaptureEvent::Begin { .. } => ProtoEvent::Enter(opposite_pos),
             CaptureEvent::Input(e) => match self.state {
-                // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
+                // connection not acknowledged: repeat `Enter`, and keep
+                // keys, buttons and scrolling for when it is
+                State::WaitingForAck => {
+                    let motion = matches!(e, Event::Pointer(PointerEvent::Motion { .. }));
+                    if !motion && self.held.len() < MAX_HELD {
+                        self.held.push(e);
+                    }
+                    ProtoEvent::Enter(opposite_pos)
+                }
                 State::Sending => ProtoEvent::Input(e),
             },
         };
@@ -547,8 +587,18 @@ impl CaptureTask {
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        // never acknowledged: what was held back doesn't go anywhere now
+        self.held.clear();
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
+            let keys = std::mem::take(&mut self.visit_keys);
+            if keys.forwarded + keys.held > 0 {
+                log::info!(
+                    "keys on client {handle}: {} sent, {} held while it acknowledged",
+                    keys.forwarded,
+                    keys.held
+                );
+            }
             // Surface the leave to the service layer so it can fire
             // the per-client leave_hook. Sent before the network
             // teardown below so we never race against the peer

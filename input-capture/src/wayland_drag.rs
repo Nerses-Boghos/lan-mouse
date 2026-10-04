@@ -238,7 +238,14 @@ fn run(edges: Receiver<Vec<Position>>) -> Result<(), Box<dyn std::error::Error>>
             // SAFETY: one valid pollfd
             let ready = unsafe { libc::poll(&mut poll, 1, 250) };
             if ready > 0 {
-                guard.read()?;
+                match guard.read() {
+                    Ok(_) => {}
+                    // readable, then nothing to read after all: normal,
+                    // try again (was fatal, silently ending the strips)
+                    Err(wayland_client::backend::WaylandError::Io(e))
+                        if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         queue.dispatch_pending(&mut state)?;
@@ -332,6 +339,7 @@ impl State {
         let file = unsafe { File::from_raw_fd(fd) };
         // zeroed memory: transparent ARGB pixels
         file.set_len(size as u64).ok()?;
+
         let pool = self.shm.create_pool(file.as_fd(), size as i32, qh, ());
         let buffer = pool.create_buffer(
             0,
