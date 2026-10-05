@@ -1,8 +1,9 @@
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 use slab::Slab;
@@ -29,9 +30,22 @@ pub struct ClientManager {
     /// [`ClientManager::connection_changed`]
     connection_changes: Rc<RefCell<HashSet<ClientHandle>>>,
     connection_changed: Rc<Notify>,
+    /// when each connected client last sent anything (it answers pings
+    /// every half second), see [`ClientManager::silent_for`]
+    heard: Rc<RefCell<HashMap<ClientHandle, Instant>>>,
 }
 
 impl ClientManager {
+    pub(crate) fn heard_from(&self, handle: ClientHandle) {
+        self.heard.borrow_mut().insert(handle, Instant::now());
+    }
+
+    /// How long a connected client has been silent, `None` when unconnected.
+    pub(crate) fn silent_for(&self, handle: ClientHandle) -> Option<Duration> {
+        self.active_addr(handle)?;
+        self.heard.borrow().get(&handle).map(Instant::elapsed)
+    }
+
     /// get all clients
     pub fn clients(&self) -> Vec<(ClientConfig, ClientState)> {
         self.clients

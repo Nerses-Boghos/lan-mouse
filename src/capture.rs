@@ -91,6 +91,7 @@ impl Capture {
             conn,
             last_send_failure: Default::default(),
             reconnect: Default::default(),
+            escapes: Vec::new(),
             desktop: Default::default(),
             entry_along: None,
             crossing: 0,
@@ -193,6 +194,16 @@ struct KeyCounts {
 /// much (keys and buttons are kept, pointer motion isn't).
 const MAX_HELD: usize = 512;
 
+/// Esc pressed this many times within [`ESCAPE_WINDOW`] brings the cursor
+/// back, whatever the other side does: the way out that works everywhere.
+const ESCAPE_TAPS: usize = 3;
+const ESCAPE_WINDOW: Duration = Duration::from_secs(1);
+
+/// The cursor comes back from a client silent for this long: it answers
+/// pings every half second, so this is several missed answers. A flaky
+/// network used to keep the cursor on a device that got nothing.
+const SILENCE_LIMIT: Duration = Duration::from_millis(1500);
+
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
     /// keys, buttons and scrolling while the client hasn't acknowledged the
@@ -213,6 +224,8 @@ struct CaptureTask {
     /// when to try connecting to each unconnected client again, and how
     /// many tries so far, see [`CaptureTask::keep_connected`]
     reconnect: HashMap<CaptureHandle, (Instant, u32)>,
+    /// recent presses of Esc while on a client, see [`ESCAPE_TAPS`]
+    escapes: Vec<Instant>,
     /// where the cursor crossed into the active client, re-sent with every `Enter`
     entry_along: Option<u16>,
     /// numbers crossings, see [`ProtoEvent::CursorPosition`]
@@ -340,9 +353,13 @@ impl CaptureTask {
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
         let mut keep_connected = tokio::time::interval(Duration::from_secs(5));
+        let mut watch_active = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
                 _ = keep_connected.tick() => self.keep_connected().await,
+                _ = watch_active.tick(), if self.active_client.is_some() => {
+                    self.release_if_silent(capture).await?;
+                }
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
@@ -410,6 +427,52 @@ impl CaptureTask {
         Ok(())
     }
 
+    /// Brings the cursor back from a client that stopped answering, see
+    /// [`SILENCE_LIMIT`].
+    async fn release_if_silent(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        let Some(handle) = self.active_client else {
+            return Ok(());
+        };
+        let silent = self.conn.client_manager().silent_for(handle);
+        if silent.is_some_and(|s| s > SILENCE_LIMIT) {
+            log::warn!("releasing capture: client {handle} stopped answering");
+            // don't cross right back into it
+            let failures = self.last_send_failure.get(&handle).map_or(0, |&(_, n)| n);
+            self.last_send_failure
+                .insert(handle, (Instant::now(), failures.saturating_add(1)));
+            self.release_capture(capture).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether Esc was just pressed [`ESCAPE_TAPS`] times in a row, quickly.
+    fn escape_tapped(&mut self, event: &CaptureEvent) -> bool {
+        const KEY_ESC: u32 = 1;
+        match event {
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                key: KEY_ESC,
+                state: 1,
+                ..
+            })) => {
+                let now = Instant::now();
+                self.escapes
+                    .retain(|t| now.duration_since(*t) < ESCAPE_WINDOW);
+                self.escapes.push(now);
+                if self.escapes.len() >= ESCAPE_TAPS {
+                    self.escapes.clear();
+                    return true;
+                }
+                false
+            }
+            // anything typed in between starts over
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { state: 1, .. })) => {
+                self.escapes.clear();
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Connects to the clients in the background, so they are ready (and
     /// shown as connected) before the cursor gets there, whether or not
     /// they announce themselves on the network. Backs off while a client
@@ -445,6 +508,10 @@ impl CaptureTask {
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
+            return self.release_capture(capture).await;
+        }
+        if self.active_client.is_some() && self.escape_tapped(&event) {
+            log::info!("releasing capture: Esc pressed {ESCAPE_TAPS} times");
             return self.release_capture(capture).await;
         }
 

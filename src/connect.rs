@@ -219,6 +219,7 @@ async fn connect_to_handle(
             }
         };
         log::info!("client ({handle}) connected @ {addr}");
+        client_manager.heard_from(handle);
         client_manager.set_active_addr(handle, Some(addr));
         conns.lock().await.insert(addr, conn.clone());
         connecting.lock().await.remove(&handle);
@@ -294,6 +295,7 @@ async fn receive_loop(
 ) {
     let mut buf = [0u8; MAX_EVENT_SIZE];
     while conn.recv(&mut buf).await.is_ok() {
+        client_manager.heard_from(handle);
         match buf.try_into() {
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
