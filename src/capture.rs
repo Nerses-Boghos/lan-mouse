@@ -90,6 +90,7 @@ impl Capture {
             captures: Default::default(),
             conn,
             last_send_failure: Default::default(),
+            reconnect: Default::default(),
             desktop: Default::default(),
             entry_along: None,
             crossing: 0,
@@ -209,6 +210,9 @@ struct CaptureTask {
     /// when sending to each client last failed, and how many times in a row,
     /// see [`retry_cooldown`]
     last_send_failure: HashMap<CaptureHandle, (Instant, u32)>,
+    /// when to try connecting to each unconnected client again, and how
+    /// many tries so far, see [`CaptureTask::keep_connected`]
+    reconnect: HashMap<CaptureHandle, (Instant, u32)>,
     /// where the cursor crossed into the active client, re-sent with every `Enter`
     entry_along: Option<u16>,
     /// numbers crossings, see [`ProtoEvent::CursorPosition`]
@@ -335,8 +339,10 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        let mut keep_connected = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
+                _ = keep_connected.tick() => self.keep_connected().await,
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
@@ -402,6 +408,31 @@ impl CaptureTask {
             }
         }
         Ok(())
+    }
+
+    /// Connects to the clients in the background, so they are ready (and
+    /// shown as connected) before the cursor gets there, whether or not
+    /// they announce themselves on the network. Backs off while a client
+    /// stays unreachable (asleep, away).
+    async fn keep_connected(&mut self) {
+        const BACKOFF: [u64; 5] = [5, 10, 20, 30, 60];
+        let now = Instant::now();
+        let handles: Vec<CaptureHandle> = self.captures.iter().map(|&(h, ..)| h).collect();
+        self.reconnect.retain(|h, _| handles.contains(h));
+        for handle in handles {
+            if self.conn.client_manager().active_addr(handle).is_some() {
+                self.reconnect.remove(&handle);
+                continue;
+            }
+            let (next, tries) = self.reconnect.get(&handle).copied().unwrap_or((now, 0));
+            if now < next {
+                continue;
+            }
+            let wait = BACKOFF[(tries as usize).min(BACKOFF.len() - 1)];
+            self.reconnect
+                .insert(handle, (now + Duration::from_secs(wait), tries + 1));
+            self.conn.connect(handle).await;
+        }
     }
 
     async fn handle_capture_event(

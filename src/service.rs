@@ -221,6 +221,7 @@ impl Service {
 
         // monitors come and go; other devices draw and map ours
         let mut monitor_check = tokio::time::interval(Duration::from_secs(10));
+        let mut checks = 0u32;
 
         loop {
             tokio::select! {
@@ -235,7 +236,13 @@ impl Service {
                         self.share_layout_on_connect(handle);
                     }
                 }
-                _ = monitor_check.tick() => self.check_monitors(),
+                _ = monitor_check.tick() => {
+                    self.check_monitors();
+                    checks += 1;
+                    if checks.is_multiple_of(6) {
+                        self.resolve_unconnected();
+                    }
+                }
                 Some((handle, files)) = self.late_drag_rx.recv() => {
                     // still on that visit, and not dropped already
                     let carrying = self.visit.as_ref()
@@ -1179,6 +1186,17 @@ impl Service {
         handles
             .into_iter()
             .find(|&handle| self.client_fingerprint(handle).as_deref() == Some(fingerprint))
+    }
+
+    /// Looks up the addresses of clients that aren't connected again, about
+    /// once a minute: they may have moved to another address (restarted,
+    /// another network) without announcing it.
+    fn resolve_unconnected(&self) {
+        for handle in self.client_manager.active_clients() {
+            if self.client_manager.active_addr(handle).is_none() {
+                self.resolve(handle);
+            }
+        }
     }
 
     fn resolve(&self, handle: ClientHandle) {

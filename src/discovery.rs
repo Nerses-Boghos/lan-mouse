@@ -11,9 +11,11 @@
 //! with the same name, so macOS renames itself ("Name-2.local"). The
 //! machine's name travels in the TXT record (`host`).
 
-use std::{collections::HashMap, net::IpAddr};
+use std::{collections::HashMap, net::IpAddr, pin::Pin, time::Duration};
 
 use lan_mouse_ipc::DiscoveredPeer;
+use tokio::time::Sleep;
+
 use mdns_sd::{DaemonEvent, IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
@@ -34,6 +36,8 @@ pub(crate) struct Discovery {
     own_fingerprint: String,
     /// discovered devices by their mDNS full name
     peers: HashMap<String, DiscoveredPeer>,
+    /// when to look around again, see [`Discovery::changed`]
+    look_again: Option<Pin<Box<Sleep>>>,
 }
 
 impl Discovery {
@@ -64,6 +68,7 @@ impl Discovery {
             announced,
             own_fingerprint: fingerprint.to_owned(),
             peers: HashMap::new(),
+            look_again: None,
         })
     }
 
@@ -80,6 +85,13 @@ impl Discovery {
                         return;
                     }
                 }
+                // A device that stops answering the cache's refresh queries
+                // counts as gone, though some (a Mac after waking up) still
+                // answer a fresh search: search again to be sure.
+                _ = async { self.look_again.as_mut().unwrap().await }, if self.look_again.is_some() => {
+                    self.look_again = None;
+                    self.browse_again();
+                }
                 Ok(DaemonEvent::IpAdd(ip)) = self.monitor.recv_async() => {
                     if !(ip.is_loopback() || is_link_local(&ip)) {
                         self.network_changed(ip);
@@ -95,6 +107,10 @@ impl Discovery {
     fn network_changed(&mut self, ip: IpAddr) {
         log::info!("new network address {ip}: announcing and looking around again");
         self.set_port(self.port);
+        self.browse_again();
+    }
+
+    fn browse_again(&mut self) {
         let _ = self.daemon.stop_browse(SERVICE_TYPE);
         match self.daemon.browse(SERVICE_TYPE) {
             Ok(events) => self.events = events,
@@ -182,9 +198,15 @@ impl Discovery {
                     .unwrap_or_else(|| info.get_hostname())
                     .trim_end_matches('.')
                     .to_owned();
+                // older versions only had the (possibly renamed) instance name
+                let name = info
+                    .get_property_val_str("name")
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| unescape(name));
                 let peer = DiscoveredPeer {
                     fingerprint: fingerprint.to_owned(),
-                    name: unescape(name),
+                    name,
                     hostname,
                     ips,
                     port: info.get_port(),
@@ -201,6 +223,7 @@ impl Discovery {
                 let removed = self.peers.remove(&fullname);
                 if let Some(peer) = &removed {
                     log::info!("{} left the network", peer.name);
+                    self.look_again = Some(Box::pin(tokio::time::sleep(Duration::from_secs(5))));
                 }
                 removed.is_some()
             }
@@ -224,12 +247,31 @@ fn announcement(
     port: u16,
     fingerprint: &str,
 ) -> Result<ServiceInfo, mdns_sd::Error> {
-    let properties = [("fp", fingerprint), ("v", PROTOCOL_VERSION), ("host", host)];
-    let own_host = format!("{}.local.", announced_host_label(fingerprint));
-    Ok(
-        ServiceInfo::new(SERVICE_TYPE, name, &own_host, "", port, &properties[..])?
-            .enable_addr_auto(),
-    )
+    let properties = [
+        ("fp", fingerprint),
+        ("v", PROTOCOL_VERSION),
+        ("host", host),
+        ("name", name),
+    ];
+    let label = announced_host_label(fingerprint);
+    let own_host = format!("{label}.local.");
+    // Unique per device, so never in conflict with another one: with
+    // probing, this device's own announcement still cached on the network
+    // (from before a restart) counted as a conflict, and the name grew a
+    // " (2)", " (3)", ... each time. The name shown is the one in the TXT
+    // record.
+    let instance = format!("{name} {label}");
+    let mut info = ServiceInfo::new(
+        SERVICE_TYPE,
+        &instance,
+        &own_host,
+        "",
+        port,
+        &properties[..],
+    )?
+    .enable_addr_auto();
+    info.set_requires_probe(false);
+    Ok(info)
 }
 
 /// The host label this device's service points at: unique per device (its
@@ -331,6 +373,9 @@ mod tests {
             info.get_property_val_str("host"),
             Some("Nerses-MacBook-Air.local")
         );
+        // shown as is, and never renamed over a conflict
+        assert_eq!(info.get_property_val_str("name"), Some("Mac"));
+        assert!(!info.requires_probe());
     }
 
     #[test]

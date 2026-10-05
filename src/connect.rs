@@ -162,7 +162,18 @@ impl LanMouseConnection {
             }
         }
 
-        // check if we are already trying to connect
+        self.connect(handle).await;
+        Err(LanMouseConnectionError::NotConnected)
+    }
+
+    /// Connects to `handle` in the background, unless connected or already
+    /// connecting.
+    pub(crate) async fn connect(&self, handle: ClientHandle) {
+        if let Some(addr) = self.client_manager.active_addr(handle) {
+            if self.conns.lock().await.contains_key(&addr) {
+                return;
+            }
+        }
         let mut connecting = self.connecting.lock().await;
         if !connecting.contains(&handle) {
             connecting.insert(handle);
@@ -177,7 +188,6 @@ impl LanMouseConnection {
                 self.ping_response.clone(),
             ));
         }
-        Err(LanMouseConnectionError::NotConnected)
     }
 }
 
