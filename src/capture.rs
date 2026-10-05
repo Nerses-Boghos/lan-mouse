@@ -1,7 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -16,6 +15,7 @@ use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
 use crate::connect::LanMouseConnection;
+use crate::exit_shortcut::{Matcher, Shortcut};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -70,15 +70,15 @@ enum CaptureRequest {
     Destroy(CaptureHandle),
     /// reenable input capture
     Reenable,
-    /// set release bind
-    SetReleaseBind(Vec<scancode::Linux>),
+    /// set the exit shortcut (`None`: switched off)
+    SetExitShortcut(Option<Shortcut>),
 }
 
 impl Capture {
     pub(crate) fn new(
         backend: Option<input_capture::Backend>,
         conn: LanMouseConnection,
-        release_bind: Vec<scancode::Linux>,
+        exit: Option<Shortcut>,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -91,13 +91,12 @@ impl Capture {
             conn,
             last_send_failure: Default::default(),
             reconnect: Default::default(),
-            escapes: Vec::new(),
             desktop: Default::default(),
             entry_along: None,
             crossing: 0,
             event_tx,
             request_rx,
-            release_bind: Rc::new(RefCell::new(release_bind)),
+            exit: exit.map(Matcher::new),
             state: Default::default(),
             held: Vec::new(),
             visit_keys: KeyCounts::default(),
@@ -153,8 +152,8 @@ impl Capture {
         self.event_rx.recv().await.expect("channel closed")
     }
 
-    pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
-        let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
+    pub(crate) fn set_exit_shortcut(&mut self, exit: Option<Shortcut>) {
+        let _ = self.request_tx.send(CaptureRequest::SetExitShortcut(exit));
     }
 }
 
@@ -194,11 +193,6 @@ struct KeyCounts {
 /// much (keys and buttons are kept, pointer motion isn't).
 const MAX_HELD: usize = 512;
 
-/// Esc pressed this many times within [`ESCAPE_WINDOW`] brings the cursor
-/// back, whatever the other side does: the way out that works everywhere.
-const ESCAPE_TAPS: usize = 3;
-const ESCAPE_WINDOW: Duration = Duration::from_secs(1);
-
 /// The cursor comes back from a client silent for this long: it answers
 /// pings every half second, so this is several missed answers. A flaky
 /// network used to keep the cursor on a device that got nothing.
@@ -224,14 +218,13 @@ struct CaptureTask {
     /// when to try connecting to each unconnected client again, and how
     /// many tries so far, see [`CaptureTask::keep_connected`]
     reconnect: HashMap<CaptureHandle, (Instant, u32)>,
-    /// recent presses of Esc while on a client, see [`ESCAPE_TAPS`]
-    escapes: Vec<Instant>,
     /// where the cursor crossed into the active client, re-sent with every `Enter`
     entry_along: Option<u16>,
     /// numbers crossings, see [`ProtoEvent::CursorPosition`]
     crossing: u16,
     event_tx: Sender<ICaptureEvent>,
-    release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
+    /// follows the exit shortcut, `None` when switched off
+    exit: Option<Matcher>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
 }
@@ -299,9 +292,7 @@ impl CaptureTask {
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
-                        CaptureRequest::SetReleaseBind(bind) => {
-                            self.release_bind.borrow_mut().clone_from(&bind);
-                        }
+                        CaptureRequest::SetExitShortcut(exit) => self.exit = exit.map(Matcher::new),
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -417,9 +408,7 @@ impl CaptureTask {
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
-                    CaptureRequest::SetReleaseBind(bind) => {
-                        self.release_bind.borrow_mut().clone_from(&bind);
-                    }
+                    CaptureRequest::SetExitShortcut(exit) => self.exit = exit.map(Matcher::new),
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -443,34 +432,6 @@ impl CaptureTask {
             self.release_capture(capture).await?;
         }
         Ok(())
-    }
-
-    /// Whether Esc was just pressed [`ESCAPE_TAPS`] times in a row, quickly.
-    fn escape_tapped(&mut self, event: &CaptureEvent) -> bool {
-        const KEY_ESC: u32 = 1;
-        match event {
-            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                key: KEY_ESC,
-                state: 1,
-                ..
-            })) => {
-                let now = Instant::now();
-                self.escapes
-                    .retain(|t| now.duration_since(*t) < ESCAPE_WINDOW);
-                self.escapes.push(now);
-                if self.escapes.len() >= ESCAPE_TAPS {
-                    self.escapes.clear();
-                    return true;
-                }
-                false
-            }
-            // anything typed in between starts over
-            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { state: 1, .. })) => {
-                self.escapes.clear();
-                false
-            }
-            _ => false,
-        }
     }
 
     /// Connects to the clients in the background, so they are ready (and
@@ -506,13 +467,17 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
-        if capture.keys_pressed(&self.release_bind.borrow()) {
-            log::info!("releasing capture: release-bind pressed");
-            return self.release_capture(capture).await;
-        }
-        if self.active_client.is_some() && self.escape_tapped(&event) {
-            log::info!("releasing capture: Esc pressed {ESCAPE_TAPS} times");
-            return self.release_capture(capture).await;
+        if let (
+            Some(exit),
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state: 1, .. })),
+        ) = (&mut self.exit, &event)
+        {
+            let pressed = scancode::Linux::try_from(*key)
+                .is_ok_and(|key| exit.press(key, |k| capture.keys_pressed(&[k])));
+            if pressed {
+                log::info!("releasing capture: exit shortcut pressed");
+                return self.release_capture(capture).await;
+            }
         }
 
         // While a client is unreachable, the cursor stays pressed against the

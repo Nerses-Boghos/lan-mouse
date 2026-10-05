@@ -11,6 +11,7 @@ mod dns;
 mod drag;
 mod emulation;
 pub mod emulation_test;
+pub mod exit_shortcut;
 mod listen;
 pub mod service;
 mod transfer;

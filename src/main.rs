@@ -172,11 +172,14 @@ fn start_service() -> Result<Child, io::Error> {
 }
 
 async fn run_service(config: Config) -> Result<(), ServiceError> {
-    let release_bind = config.release_bind();
+    let exit = config.active_exit_shortcut();
     let config_path = config.config_path().to_owned();
     let mut service = Service::new(config).await?;
     log::info!("using config: {config_path:?}");
-    log::info!("Press {release_bind:?} to release the mouse");
+    match exit {
+        Some(exit) => log::info!("exit shortcut (brings the cursor back): {exit}"),
+        None => log::info!("exit shortcut switched off"),
+    }
     service.run().await?;
     log::info!("service exited!");
     Ok(())

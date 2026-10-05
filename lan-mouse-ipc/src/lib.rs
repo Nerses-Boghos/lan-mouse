@@ -313,6 +313,9 @@ pub enum FrontendEvent {
     Transfer(TransferUpdate),
     /// whether the clipboard follows the cursor to other devices
     ClipboardStatus(bool),
+    /// the keys bringing the cursor back to this device (e.g. "Esc Esc
+    /// Esc"), and whether they work
+    ExitShortcut { enabled: bool, keys: String },
     /// a device asks to pair; answer with [`FrontendRequest::PairResponse`].
     /// `pos` is where the requesting device will be relative to this one.
     PairRequest {
@@ -407,6 +410,9 @@ pub enum FrontendRequest {
     Discover,
     /// share the clipboard with other devices, or stop
     SetClipboard(bool),
+    /// switch the exit shortcut on or off and change its keys (`None`:
+    /// keep them); written like "Esc Esc Esc" or "Ctrl+Shift+Super+Alt"
+    SetExitShortcut { enabled: bool, keys: Option<String> },
     /// send files and folders (absolute paths) to the paired device with
     /// this fingerprint; `id` identifies the transfer in its updates
     SendFiles {

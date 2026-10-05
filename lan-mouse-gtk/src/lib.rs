@@ -390,7 +390,8 @@ fn build_ui(app: &Application) {
                     }
                     FrontendEvent::Discovered(_)
                     | FrontendEvent::Controlling(_)
-                    | FrontendEvent::ClipboardStatus(_) => {}
+                    | FrontendEvent::ClipboardStatus(_)
+                    | FrontendEvent::ExitShortcut { .. } => {}
                     FrontendEvent::DeviceConnected {
                         fingerprint: _,
                         addr,

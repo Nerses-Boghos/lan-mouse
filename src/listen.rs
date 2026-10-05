@@ -18,9 +18,11 @@ use webrtc_dtls::{
     config::{ClientAuthType::RequireAnyClientCert, Config, ExtendedMasterSecretType},
     conn::DTLSConn,
     crypto::Certificate,
-    listener::listen,
 };
-use webrtc_util::{Conn, Error, conn::Listener};
+use webrtc_util::{
+    Conn, Error,
+    conn::{Listener, conn_udp_listener::ListenConfig},
+};
 
 use crate::crypto;
 
@@ -110,7 +112,7 @@ impl LanMouseListener {
         };
 
         let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
-        let mut listener = listen(listen_addr, cfg.clone()).await?;
+        let mut listener = listen(listen_addr).await?;
 
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
@@ -121,45 +123,34 @@ impl LanMouseListener {
             let connection_attempts = connection_attempts.clone();
             spawn_local(async move {
                 loop {
-                    let sleep = tokio::time::sleep(Duration::from_secs(2));
                     tokio::select! {
-                        /* workaround for https://github.com/webrtc-rs/webrtc/issues/614 */
-                        _ = sleep => continue,
                         c = listener.accept() => match c {
+                            // The handshake runs on its own: done inside the
+                            // accept loop, one stalled handshake held up all
+                            // others, and the loop's workaround for that (a
+                            // fresh accept every 2s) cut off handshakes still
+                            // running, so devices on a slow network often
+                            // couldn't connect at all.
                             Ok((conn, addr)) => {
-                                log::info!("dtls client connected, ip: {addr}");
-                                let mut conns = conns_clone.lock().await;
-                                conns.push((addr, conn.clone()));
-                                let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-                                let certs = dtls_conn.connection_state().await.peer_certificates;
-                                let cert = certs.first().expect("cert");
-                                let fingerprint = crypto::generate_fingerprint(cert);
-                                listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
-                            },
+                                spawn_local(handshake(
+                                    conn,
+                                    addr,
+                                    cfg.clone(),
+                                    conns_clone.clone(),
+                                    listen_tx.clone(),
+                                    connection_attempts.clone(),
+                                ));
+                            }
                             Err(e) => {
-                                if let Error::Std(ref e) = e {
-                                    if let Some(e) = e.0.downcast_ref::<webrtc_dtls::Error>() {
-                                        match e {
-                                            webrtc_dtls::Error::ErrVerifyDataMismatch => {
-                                                if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
-                                                    listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
-                                                }
-                                            }
-                                            _ => log::warn!("accept: {e}"),
-                                        }
-                                    } else {
-                                        log::warn!("accept: {e:?}");
-                                    }
-                                } else {
-                                    log::warn!("accept: {e:?}");
-                                }
+                                log::warn!("accept: {e:?}");
+                                // e.g. the socket closed: don't spin
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         },
                         port = request_port_change_rx.recv() => {
                             let port = port.expect("channel closed");
                             let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
-                            match listen(listen_addr, cfg.clone()).await {
+                            match listen(listen_addr).await {
                                 Ok(new_listener) => {
                                     let _ = listener.close().await;
                                     listener = new_listener;
@@ -258,6 +249,77 @@ impl Stream for LanMouseListener {
     ) -> std::task::Poll<Option<Self::Item>> {
         self.listen_rx.poll_next_unpin(cx)
     }
+}
+
+/// Listens for DTLS handshakes on UDP `addr`: datagrams from a new address
+/// open a connection only if they are handshake records.
+async fn listen(addr: SocketAddr) -> Result<impl Listener, webrtc_util::Error> {
+    /// the DTLS record content type of handshake messages
+    const HANDSHAKE: u8 = 22;
+    let mut config = ListenConfig {
+        accept_filter: Some(Box::new(|packet: &[u8]| {
+            let handshake = packet.first() == Some(&HANDSHAKE);
+            Box::pin(async move { handshake })
+        })),
+        ..Default::default()
+    };
+    config.listen(addr).await
+}
+
+/// How long a device gets to complete the handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Completes the DTLS handshake with a device that just reached out, then
+/// reads from it.
+async fn handshake(
+    conn: ArcConn,
+    addr: SocketAddr,
+    cfg: Config,
+    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
+    listen_tx: Sender<ListenEvent>,
+    connection_attempts: Arc<Mutex<VecDeque<String>>>,
+) {
+    let dtls = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        DTLSConn::new(conn.clone(), cfg, false, None),
+    )
+    .await;
+    let dtls = match dtls {
+        Ok(Ok(dtls)) => dtls,
+        Ok(Err(webrtc_dtls::Error::ErrVerifyDataMismatch)) => {
+            if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
+                listen_tx
+                    .send(ListenEvent::Rejected { fingerprint })
+                    .expect("channel closed");
+            }
+            // forget the address, so its next attempt starts afresh
+            let _ = conn.close().await;
+            return;
+        }
+        Ok(Err(e)) => {
+            log::warn!("handshake with {addr} failed: {e}");
+            let _ = conn.close().await;
+            return;
+        }
+        Err(_) => {
+            log::warn!("handshake with {addr} timed out");
+            let _ = conn.close().await;
+            return;
+        }
+    };
+    log::info!("dtls client connected, ip: {addr}");
+    let certs = dtls.connection_state().await.peer_certificates;
+    let Some(cert) = certs.first() else {
+        let _ = dtls.close().await;
+        return;
+    };
+    let fingerprint = crypto::generate_fingerprint(cert);
+    let dtls: ArcConn = Arc::new(dtls);
+    conns.lock().await.push((addr, dtls.clone()));
+    listen_tx
+        .send(ListenEvent::Accept { addr, fingerprint })
+        .expect("channel closed");
+    let _ = read_loop(conns, addr, dtls, listen_tx).await;
 }
 
 async fn read_loop(

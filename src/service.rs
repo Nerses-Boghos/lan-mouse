@@ -9,6 +9,7 @@ use crate::{
     dns::{DnsEvent, DnsResolver},
     drag,
     emulation::{Emulation, EmulationEvent},
+    exit_shortcut::Shortcut,
     listen::{LanMouseListener, ListenerCreationError},
 };
 use futures::StreamExt;
@@ -163,7 +164,7 @@ impl Service {
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
-        let capture = Capture::new(capture_backend, conn, config.release_bind());
+        let capture = Capture::new(capture_backend, conn, config.active_exit_shortcut());
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener);
 
@@ -357,6 +358,9 @@ impl Service {
                 self.save_config();
                 self.notify_frontend(FrontendEvent::ClipboardStatus(enabled));
             }
+            FrontendRequest::SetExitShortcut { enabled, keys } => {
+                self.set_exit_shortcut(enabled, keys)
+            }
             FrontendRequest::Pair { fingerprint, pos } => self.start_pairing(fingerprint, pos),
             FrontendRequest::PairResponse {
                 fingerprint,
@@ -408,8 +412,9 @@ impl Service {
             }
             self.notify_frontend(FrontendEvent::Created(handle, c, s));
         }
-        let release_bind = self.config.release_bind();
-        self.capture.set_release_bind(release_bind);
+        self.capture
+            .set_exit_shortcut(self.config.active_exit_shortcut());
+        self.notify_exit_shortcut();
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
@@ -1199,6 +1204,32 @@ impl Service {
         }
     }
 
+    /// Switch the exit shortcut on or off, and change its keys (`None`:
+    /// keep them).
+    fn set_exit_shortcut(&mut self, enabled: bool, keys: Option<String>) {
+        let shortcut = match keys.as_deref().map(str::parse::<Shortcut>) {
+            None => self.config.exit_shortcut(),
+            Some(Ok(shortcut)) => shortcut,
+            Some(Err(e)) => {
+                return self.notify_frontend(FrontendEvent::Error(format!(
+                    "can't use that exit shortcut: {e}"
+                )));
+            }
+        };
+        self.config.set_exit_shortcut(enabled, &shortcut);
+        self.save_config();
+        self.capture
+            .set_exit_shortcut(self.config.active_exit_shortcut());
+        self.notify_exit_shortcut();
+    }
+
+    fn notify_exit_shortcut(&mut self) {
+        self.notify_frontend(FrontendEvent::ExitShortcut {
+            enabled: self.config.exit_shortcut_enabled(),
+            keys: self.config.exit_shortcut().to_string(),
+        });
+    }
+
     fn resolve(&self, handle: ClientHandle) {
         if let Some(hostname) = self.client_manager.get_hostname(handle) {
             self.resolver.resolve(handle, hostname);
@@ -1216,6 +1247,7 @@ impl Service {
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.notify_frontend(FrontendEvent::ClipboardStatus(self.config.clipboard()));
+        self.notify_exit_shortcut();
         // requests that arrived before this frontend connected
         self.pending_pairs.retain(|_, p| !p.reply.is_closed());
         let requests: Vec<_> = self

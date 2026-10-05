@@ -120,6 +120,14 @@ enum CliSubcommand {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
+    /// the keys that bring the cursor back to this device: show them,
+    /// switch them on or off, or set them (e.g. "Esc Esc Esc" for Esc three
+    /// times, "Ctrl+Shift+Super+Alt" for those held together)
+    ExitShortcut {
+        #[arg(value_parser = ["show", "on", "off", "set"], default_value = "show")]
+        action: String,
+        keys: Option<String>,
+    },
     /// re-enable capture
     EnableCapture,
     /// re-enable emulation
@@ -232,6 +240,44 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::Clipboard { state } => {
             tx.request(FrontendRequest::SetClipboard(state == "on"))
                 .await?
+        }
+        CliSubcommand::ExitShortcut { action, keys } => {
+            // the current setting comes first: connecting syncs
+            let mut enabled = true;
+            while let Some(e) = rx.next().await {
+                if let FrontendEvent::ExitShortcut { enabled: e, keys } = e? {
+                    if action == "show" {
+                        println!("{keys} ({})", if e { "on" } else { "off" });
+                        return Ok(());
+                    }
+                    enabled = e;
+                    break;
+                }
+            }
+            let (enabled, keys) = match action.as_str() {
+                "on" => (true, None),
+                "off" => (false, None),
+                _ => match keys {
+                    Some(keys) => (enabled, Some(keys)),
+                    None => {
+                        return Err(CliError::Failed(
+                            "set needs the keys, e.g. \"Esc Esc Esc\"".into(),
+                        ));
+                    }
+                },
+            };
+            tx.request(FrontendRequest::SetExitShortcut { enabled, keys })
+                .await?;
+            while let Some(e) = rx.next().await {
+                match e? {
+                    FrontendEvent::ExitShortcut { enabled, keys } => {
+                        println!("{keys} ({})", if enabled { "on" } else { "off" });
+                        break;
+                    }
+                    FrontendEvent::Error(e) => return Err(CliError::Failed(e)),
+                    _ => {}
+                }
+            }
         }
         CliSubcommand::EnableCapture => tx.request(FrontendRequest::EnableCapture).await?,
         CliSubcommand::EnableEmulation => tx.request(FrontendRequest::EnableEmulation).await?,

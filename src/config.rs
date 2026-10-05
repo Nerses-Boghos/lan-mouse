@@ -19,10 +19,9 @@ use toml_edit::{self, DocumentMut};
 use lan_mouse_cli::CliArgs;
 use lan_mouse_ipc::{DEFAULT_PORT, Position};
 
-use input_event::scancode::{
-    self,
-    Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
-};
+use input_event::scancode;
+
+use crate::exit_shortcut::{DEFAULT as DEFAULT_EXIT, Shortcut};
 
 use shadow_rs::shadow;
 
@@ -73,6 +72,10 @@ struct ConfigToml {
     clipboard: Option<bool>,
     /// name shown to other devices (default: the host name)
     name: Option<String>,
+    /// keys bringing the cursor back to this device, see [`Shortcut`]
+    exit_shortcut: Option<String>,
+    /// whether the exit shortcut works (default: on)
+    exit_shortcut_enabled: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -360,9 +363,6 @@ pub enum ConfigError {
     Watcher(#[from] notify::Error),
 }
 
-const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
-    [KeyLeftCtrl, KeyLeftShift, KeyLeftMeta, KeyLeftAlt];
-
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
@@ -533,12 +533,42 @@ impl Config {
             .clipboard = Some(enabled);
     }
 
-    /// release bind for returning control to the host
-    pub fn release_bind(&self) -> Vec<scancode::Linux> {
+    /// The keys bringing the cursor back to this device: as configured, as
+    /// the older `release_bind` setting had them, or Esc three times.
+    pub fn exit_shortcut(&self) -> Shortcut {
+        let toml = self.config_toml.as_ref();
+        if let Some(text) = toml.and_then(|c| c.exit_shortcut.as_deref()) {
+            match text.parse() {
+                Ok(shortcut) => return shortcut,
+                Err(e) => log::warn!("exit shortcut \"{text}\": {e}; using {DEFAULT_EXIT}"),
+            }
+        } else if let Some(shortcut) = toml
+            .and_then(|c| c.release_bind.as_deref())
+            .and_then(Shortcut::from_keys)
+        {
+            return shortcut;
+        }
+        DEFAULT_EXIT.parse().expect("valid default")
+    }
+
+    pub fn exit_shortcut_enabled(&self) -> bool {
         self.config_toml
             .as_ref()
-            .and_then(|c| c.release_bind.clone())
-            .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
+            .and_then(|c| c.exit_shortcut_enabled)
+            .unwrap_or(true)
+    }
+
+    /// The exit shortcut, `None` when switched off.
+    pub fn active_exit_shortcut(&self) -> Option<Shortcut> {
+        self.exit_shortcut_enabled().then(|| self.exit_shortcut())
+    }
+
+    pub fn set_exit_shortcut(&mut self, enabled: bool, shortcut: &Shortcut) {
+        let toml = self.config_toml.get_or_insert_with(Default::default);
+        toml.exit_shortcut_enabled = Some(enabled);
+        toml.exit_shortcut = Some(shortcut.to_string());
+        // replaced by the above
+        toml.release_bind = None;
     }
 
     /// set configured clients
