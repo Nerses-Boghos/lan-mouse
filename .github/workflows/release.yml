@@ -241,6 +241,9 @@ jobs:
 
   release:
     name: "Release"
+    # publishing a release needs to write to the repository
+    permissions:
+      contents: write
     needs: [windows-release-build, linux-release-build, linux-arm64-release-build, macos-release-build, macos-arm64-release-build]
     runs-on: "ubuntu-latest"
     steps:

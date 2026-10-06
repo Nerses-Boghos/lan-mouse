@@ -31,6 +31,7 @@ use std::{
     sync::{Arc, OnceLock},
     task::{Context, Poll, ready},
     thread::{self},
+    time::{Duration, Instant},
 };
 use tokio::sync::{
     Mutex,
@@ -38,7 +39,10 @@ use tokio::sync::{
     oneshot,
 };
 
-#[derive(Debug, Default)]
+/// How often the display area is measured again (see [`InputCaptureState::crossed`]).
+const REMEASURE: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Default, PartialEq)]
 struct Bounds {
     xmin: f64,
     xmax: f64,
@@ -54,8 +58,9 @@ struct InputCaptureState {
     current_pos: Option<Position>,
     /// position where the cursor was captured
     enter_position: Option<CGPoint>,
-    /// bounds of the input capture area
+    /// bounds of the input capture area, and when they were measured
     bounds: Bounds,
+    measured: Instant,
     /// current state of modifier keys
     modifier_state: XMods,
 }
@@ -77,6 +82,7 @@ impl InputCaptureState {
             current_pos: None,
             enter_position: None,
             bounds: Bounds::default(),
+            measured: Instant::now(),
             modifier_state: Default::default(),
         };
         res.update_bounds()?;
@@ -84,6 +90,22 @@ impl InputCaptureState {
     }
 
     fn crossed(&mut self, event: &CGEvent) -> Option<Position> {
+        // Displays change without notice at times (unplugged while asleep):
+        // measure again now and then, and always before crossing, so an
+        // outdated edge neither stops the cursor mid-screen nor keeps it
+        // from reaching the real one.
+        if self.measured.elapsed() > REMEASURE {
+            let _ = self.update_bounds();
+        }
+        let position = self.crossed_bounds(event)?;
+        if self.measured.elapsed() > Duration::from_millis(50) {
+            let _ = self.update_bounds();
+            return self.crossed_bounds(event);
+        }
+        Some(position)
+    }
+
+    fn crossed_bounds(&self, event: &CGEvent) -> Option<Position> {
         let location = event.location();
         let relative_x = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
         let relative_y = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
@@ -114,19 +136,34 @@ impl InputCaptureState {
         }
     }
 
-    // Get the max bounds of all displays
+    /// Measure the area covered by the displays connected now (and only
+    /// those: displays from before used to stay in it, putting the edge
+    /// where no screen is any more).
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
-        active_ids.iter().for_each(|d| {
-            let bounds = CGDisplay::new(*d).bounds();
-            self.bounds.xmin = self.bounds.xmin.min(bounds.origin.x);
-            self.bounds.xmax = self.bounds.xmax.max(bounds.origin.x + bounds.size.width);
-            self.bounds.ymin = self.bounds.ymin.min(bounds.origin.y);
-            self.bounds.ymax = self.bounds.ymax.max(bounds.origin.y + bounds.size.height);
-        });
-
-        log::debug!("Updated displays bounds: {0:?}", self.bounds);
+        let mut displays = active_ids.iter().map(|d| CGDisplay::new(*d).bounds());
+        let Some(first) = displays.next() else {
+            // none (closed lid, display asleep): keep the last ones
+            return Ok(());
+        };
+        let mut bounds = Bounds {
+            xmin: first.origin.x,
+            xmax: first.origin.x + first.size.width,
+            ymin: first.origin.y,
+            ymax: first.origin.y + first.size.height,
+        };
+        for d in displays {
+            bounds.xmin = bounds.xmin.min(d.origin.x);
+            bounds.xmax = bounds.xmax.max(d.origin.x + d.size.width);
+            bounds.ymin = bounds.ymin.min(d.origin.y);
+            bounds.ymax = bounds.ymax.max(d.origin.y + d.size.height);
+        }
+        if bounds != self.bounds {
+            log::info!("display area: {bounds:?}");
+        }
+        self.bounds = bounds;
+        self.measured = Instant::now();
         Ok(())
     }
 
