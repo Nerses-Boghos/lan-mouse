@@ -189,6 +189,8 @@ fn retry_cooldown(failures: u32) -> Duration {
 struct KeyCounts {
     forwarded: usize,
     held: usize,
+    /// pointer events: whether input arrived at all
+    pointer: usize,
 }
 
 /// Input held back until a client acknowledges the crossing, at most this
@@ -450,7 +452,13 @@ impl CaptureTask {
     async fn keep_connected(&mut self) {
         const BACKOFF: [u64; 5] = [5, 10, 20, 30, 60];
         let now = Instant::now();
-        let handles: Vec<CaptureHandle> = self.captures.iter().map(|&(h, ..)| h).collect();
+        // devices this one sends to (not those only coming in)
+        let handles: Vec<CaptureHandle> = self
+            .captures
+            .iter()
+            .filter(|&&(.., t)| t == CaptureType::Default)
+            .map(|&(h, ..)| h)
+            .collect();
         self.reconnect.retain(|h, _| handles.contains(h));
         for handle in handles {
             if self.conn.client_manager().active_addr(handle).is_some() {
@@ -476,10 +484,14 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
+        // events also reach a device's incoming-only capture at the same
+        // edge: count each key once
+        let outgoing = self.get_type(handle) == CaptureType::Default;
         if let (
+            true,
             Some(exit),
             CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state: 1, .. })),
-        ) = (&mut self.exit, &event)
+        ) = (outgoing, &mut self.exit, &event)
         {
             let pressed = scancode::Linux::try_from(*key)
                 .is_ok_and(|key| exit.press(key, |k| capture.keys_pressed(&[k])));
@@ -564,11 +576,13 @@ impl CaptureTask {
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { .. })) = event {
-            match self.state {
+        match event {
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { .. })) => match self.state {
                 State::WaitingForAck => self.visit_keys.held += 1,
                 State::Sending => self.visit_keys.forwarded += 1,
-            }
+            },
+            CaptureEvent::Input(Event::Pointer(_)) => self.visit_keys.pointer += 1,
+            _ => {}
         }
         let event = match event {
             CaptureEvent::Begin { .. } => ProtoEvent::Enter(opposite_pos),
@@ -673,13 +687,12 @@ impl CaptureTask {
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             let keys = std::mem::take(&mut self.visit_keys);
-            if keys.forwarded + keys.held > 0 {
-                log::info!(
-                    "keys on client {handle}: {} sent, {} held while it acknowledged",
-                    keys.forwarded,
-                    keys.held
-                );
-            }
+            log::info!(
+                "visit to client {handle}: {} pointer events, keys {} sent, {} held while it acknowledged",
+                keys.pointer,
+                keys.forwarded,
+                keys.held
+            );
             // Surface the leave to the service layer so it can fire
             // the per-client leave_hook. Sent before the network
             // teardown below so we never race against the peer

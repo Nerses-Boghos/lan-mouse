@@ -618,6 +618,7 @@ async fn handle_ei_event(
         }
         /* EiEvent::DeviceAdded(_) | */
         EiEvent::DeviceRemoved(_) => {
+            log::info!("compositor input device: {ei_event:?}");
             if *RESTART_SESSION_ON_DEVICE_CHANGE {
                 log::debug!("releasing session: {ei_event:?}");
                 release_session.notify_waiters();
@@ -625,7 +626,11 @@ async fn handle_ei_event(
                 log::debug!("ignoring device change: {ei_event:?}");
             }
         }
-        EiEvent::DevicePaused(_) | EiEvent::DeviceResumed(_) => {}
+        // rare, and the first thing to check when keys go missing
+        EiEvent::DevicePaused(_) | EiEvent::DeviceResumed(_) => {
+            log::info!("compositor input device: {ei_event:?}");
+        }
+        EiEvent::DeviceAdded(_) => log::info!("compositor input device: {ei_event:?}"),
         EiEvent::DeviceStartEmulating(_) => log::debug!("START EMULATING"),
         EiEvent::DeviceStopEmulating(_) => log::debug!("STOP EMULATING"),
         EiEvent::Disconnected(d) => {
@@ -639,6 +644,8 @@ async fn handle_ei_event(
                         .await
                         .expect("no channel");
                 }
+            } else if matches!(ei_event, EiEvent::KeyboardKey(_)) {
+                log::info!("a key came from the compositor while nothing was captured");
             }
         }
     }
