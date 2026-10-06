@@ -23,6 +23,10 @@ impl Capture for X11InputCapture {
         Ok(())
     }
 
+    async fn release_away(&mut self) -> Result<(), CaptureError> {
+        self.release().await
+    }
+
     async fn release(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }

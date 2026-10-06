@@ -68,6 +68,8 @@ struct InputCaptureState {
 #[derive(Debug)]
 enum ProducerEvent {
     Release,
+    /// release, the cursor away from the edge
+    ReleaseAway,
     Create(Position),
     Destroy(Position),
     Grab(Position),
@@ -203,6 +205,21 @@ impl InputCaptureState {
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
+            ProducerEvent::ReleaseAway => {
+                if let (Some(pos), Some(at)) = (self.current_pos, self.enter_position) {
+                    let d = crate::RELEASE_AWAY;
+                    let (dx, dy) = match pos {
+                        Position::Left => (d, 0.),
+                        Position::Right => (-d, 0.),
+                        Position::Top => (0., d),
+                        Position::Bottom => (0., -d),
+                    };
+                    let away = CGPoint::new(at.x + dx, at.y + dy);
+                    let _ = CGDisplay::warp_mouse_cursor_position(away);
+                    self.show_cursor()?;
+                    self.current_pos = None;
+                }
+            }
             ProducerEvent::Release => {
                 if self.current_pos.is_some() {
                     self.show_cursor()?;
@@ -845,6 +862,14 @@ impl Capture for MacOSInputCapture {
         tokio::task::spawn_local(async move {
             log::debug!("notifying Release");
             let _ = notify_tx.send(ProducerEvent::Release).await;
+        });
+        Ok(())
+    }
+
+    async fn release_away(&mut self) -> Result<(), CaptureError> {
+        let notify_tx = self.notify_tx.clone();
+        tokio::task::spawn_local(async move {
+            let _ = notify_tx.send(ProducerEvent::ReleaseAway).await;
         });
         Ok(())
     }

@@ -46,6 +46,10 @@ impl Capture for DummyInputCapture {
         Ok(())
     }
 
+    async fn release_away(&mut self) -> Result<(), CaptureError> {
+        self.release().await
+    }
+
     async fn release(&mut self) -> Result<(), CaptureError> {
         self.begin_pending = true;
         Ok(())

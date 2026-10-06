@@ -80,6 +80,8 @@ enum LibeiNotifyEvent {
 #[derive(Default)]
 struct ReleaseRequest {
     notify: Notify,
+    /// put the cursor away from the edge, see [`InputCapture::release_away`]
+    away: std::sync::atomic::AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -469,7 +471,10 @@ async fn do_capture_session(
                         },
                     }
 
-                    release_capture(input_capture, session, activated, pos).await?;
+                    let away = notify_release
+                        .away
+                        .swap(false, std::sync::atomic::Ordering::Relaxed);
+                    release_capture(input_capture, session, activated, pos, away).await?;
 
                 }
                 _ = notify_release.notify.notified() => { /* capture release -> we are not capturing anyway, so ignore */
@@ -513,6 +518,7 @@ async fn release_capture(
     session: &Session<InputCapture>,
     activated: Activated,
     current_pos: Position,
+    away: bool,
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
@@ -528,8 +534,9 @@ async fn release_capture(
         Position::Top => (0., 1.),
         Position::Bottom => (0., -1.),
     };
-    // release 1px inside the entered zone
-    let cursor_position = (x as f64 + dx, y as f64 + dy);
+    // release 1px inside the entered zone, or well inside
+    let distance = if away { crate::RELEASE_AWAY } else { 1. };
+    let cursor_position = (x as f64 + dx * distance, y as f64 + dy * distance);
     let release_options = ReleaseOptions::default()
         .set_activation_id(activated.activation_id())
         .set_cursor_position(Some(cursor_position));
@@ -657,6 +664,14 @@ impl LanMouseInputCapture for LibeiInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
+        self.notify_release.notify.notify_waiters();
+        Ok(())
+    }
+
+    async fn release_away(&mut self) -> Result<(), CaptureError> {
+        self.notify_release
+            .away
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.notify_release.notify.notify_waiters();
         Ok(())
     }

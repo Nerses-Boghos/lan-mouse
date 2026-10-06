@@ -29,6 +29,10 @@ mod macos_drag;
 /// Marks events Lan Mouse posts on this device for itself (in the event's
 /// source user data, macOS): capture lets them through to the local system
 /// instead of sending them to the device being controlled.
+/// How far from the edge [`InputCapture::release_away`] puts the cursor.
+#[allow(dead_code)]
+const RELEASE_AWAY: f64 = 300.;
+
 pub const LOCAL_EVENT_MARKER: i64 = 0x4c4d_4f55_5345; // "LMOUSE"
 
 /// The files of a drag in progress on this device (with the left button
@@ -230,6 +234,13 @@ impl InputCapture {
         self.capture.release().await
     }
 
+    /// Release the mouse, the cursor well away from the edge: asked for
+    /// (the exit shortcut), so it shouldn't slip right back.
+    pub async fn release_away(&mut self) -> Result<(), CaptureError> {
+        self.pressed_keys.clear();
+        self.capture.release_away().await
+    }
+
     /// Drain and return every key the capture has forwarded as
     /// down-but-not-up. The caller is expected to synthesize key-up
     /// events to the remote peer for each — otherwise the peer
@@ -360,6 +371,10 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
 
+    /// release mouse, the cursor away from the edge (see
+    /// [`InputCapture::release_away`])
+    async fn release_away(&mut self) -> Result<(), CaptureError>;
+
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
 }
@@ -451,6 +466,9 @@ mod stream_tests {
             Ok(())
         }
         async fn release(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn release_away(&mut self) -> Result<(), CaptureError> {
             Ok(())
         }
         async fn terminate(&mut self) -> Result<(), CaptureError> {

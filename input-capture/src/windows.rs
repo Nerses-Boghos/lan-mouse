@@ -29,6 +29,10 @@ impl Capture for WindowsInputCapture {
         Ok(())
     }
 
+    async fn release_away(&mut self) -> Result<(), CaptureError> {
+        self.release().await
+    }
+
     async fn release(&mut self) -> Result<(), CaptureError> {
         self.event_thread.release_capture();
         Ok(())

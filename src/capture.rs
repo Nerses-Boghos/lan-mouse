@@ -97,6 +97,8 @@ impl Capture {
             event_tx,
             request_rx,
             exit: exit.map(Matcher::new),
+            release_away: false,
+            hold_crossing_until: None,
             state: Default::default(),
             held: Vec::new(),
             visit_keys: KeyCounts::default(),
@@ -193,6 +195,9 @@ struct KeyCounts {
 /// much (keys and buttons are kept, pointer motion isn't).
 const MAX_HELD: usize = 512;
 
+/// No crossing for this long after the exit shortcut.
+const EXIT_HOLD: Duration = Duration::from_secs(1);
+
 /// The cursor comes back from a client silent for this long: it answers
 /// pings every half second, so this is several missed answers. A flaky
 /// network used to keep the cursor on a device that got nothing.
@@ -225,6 +230,10 @@ struct CaptureTask {
     event_tx: Sender<ICaptureEvent>,
     /// follows the exit shortcut, `None` when switched off
     exit: Option<Matcher>,
+    /// the next release puts the cursor away from the edge
+    release_away: bool,
+    /// no crossing until then: right after the exit shortcut
+    hold_crossing_until: Option<Instant>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
 }
@@ -476,6 +485,10 @@ impl CaptureTask {
                 .is_ok_and(|key| exit.press(key, |k| capture.keys_pressed(&[k])));
             if pressed {
                 log::info!("releasing capture: exit shortcut pressed");
+                // back well inside this screen, and staying here a moment:
+                // the hand still on the mouse used to cross right back
+                self.release_away = true;
+                self.hold_crossing_until = Some(Instant::now() + EXIT_HOLD);
                 return self.release_capture(capture).await;
             }
         }
@@ -483,6 +496,11 @@ impl CaptureTask {
         // While a client is unreachable, the cursor stays pressed against the
         // edge and re-triggers capture continuously. Don't retry (and fire the
         // enter hook) on every one of those until the cooldown has passed.
+        if matches!(event, CaptureEvent::Begin { .. })
+            && self.hold_crossing_until.is_some_and(|t| Instant::now() < t)
+        {
+            return capture.release().await;
+        }
         if matches!(event, CaptureEvent::Begin { .. })
             && self
                 .last_send_failure
@@ -709,7 +727,11 @@ impl CaptureTask {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }
-        capture.release().await
+        if std::mem::take(&mut self.release_away) {
+            capture.release_away().await
+        } else {
+            capture.release().await
+        }
     }
 }
 
