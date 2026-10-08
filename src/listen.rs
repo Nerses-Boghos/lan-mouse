@@ -3,6 +3,7 @@ use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
+    cell::Cell,
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     rc::Rc,
@@ -118,6 +119,7 @@ impl LanMouseListener {
             Rc::new(AsyncMutex::new(Vec::new()));
 
         let conns_clone = conns.clone();
+        let handshakes: Rc<Cell<usize>> = Default::default();
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let connection_attempts = connection_attempts.clone();
@@ -131,6 +133,12 @@ impl LanMouseListener {
                             // fresh accept every 2s) cut off handshakes still
                             // running, so devices on a slow network often
                             // couldn't connect at all.
+                            // Strangers can start any number of handshakes;
+                            // only so many are worked on at once.
+                            Ok((conn, addr)) if handshakes.get() >= MAX_HANDSHAKES => {
+                                log::warn!("too many devices connecting at once, turning {addr} away");
+                                let _ = conn.close().await;
+                            }
                             Ok((conn, addr)) => {
                                 spawn_local(handshake(
                                     conn,
@@ -139,6 +147,7 @@ impl LanMouseListener {
                                     conns_clone.clone(),
                                     listen_tx.clone(),
                                     connection_attempts.clone(),
+                                    Counted::new(&handshakes),
                                 ));
                             }
                             Err(e) => {
@@ -268,6 +277,24 @@ async fn listen(addr: SocketAddr) -> Result<impl Listener, webrtc_util::Error> {
 
 /// How long a device gets to complete the handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most handshakes worked on at once (a device needs one).
+const MAX_HANDSHAKES: usize = 16;
+
+/// Counts something under way in `count` for as long as it lives.
+struct Counted(Rc<Cell<usize>>);
+
+impl Counted {
+    fn new(count: &Rc<Cell<usize>>) -> Self {
+        count.set(count.get() + 1);
+        Self(count.clone())
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
 
 /// Completes the DTLS handshake with a device that just reached out, then
 /// reads from it.
@@ -278,6 +305,7 @@ async fn handshake(
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     listen_tx: Sender<ListenEvent>,
     connection_attempts: Arc<Mutex<VecDeque<String>>>,
+    counted: Counted,
 ) {
     let dtls = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
@@ -307,6 +335,8 @@ async fn handshake(
             return;
         }
     };
+    // the handshake is over: no longer counted
+    drop(counted);
     log::info!("dtls client connected, ip: {addr}");
     let certs = dtls.connection_state().await.peer_certificates;
     let Some(cert) = certs.first() else {

@@ -310,6 +310,7 @@ impl Control {
             clipboard_enabled: clipboard_enabled.clone(),
             peer_clipboard: peer_clipboard.clone(),
             event_tx: event_tx.clone(),
+            log_requests: Default::default(),
         };
         let accept_task = spawn_local(accept_loop(listener, acceptor.clone(), handler.clone()));
         if let Some(downloads) = transfer::downloads_dir() {
@@ -754,7 +755,12 @@ struct Handler {
     clipboard_enabled: ClipboardSwitch,
     peer_clipboard: PeerClipboards,
     event_tx: Sender<ControlEvent>,
+    /// when each device last got this device's log, see [`LOG_INTERVAL`]
+    log_requests: Rc<RefCell<HashMap<String, Instant>>>,
 }
+
+/// A device gets this device's log at most this often.
+const LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 impl Handler {
     async fn handle<S>(
@@ -838,6 +844,18 @@ impl Handler {
                 Ok(())
             }
             KIND_LOG_REQUEST => {
+                // collecting it costs: not again right away
+                let recent = self
+                    .log_requests
+                    .borrow()
+                    .get(&fingerprint)
+                    .is_some_and(|at| at.elapsed() < LOG_INTERVAL);
+                if recent {
+                    return Err(ControlError::TooManyAttempts);
+                }
+                self.log_requests
+                    .borrow_mut()
+                    .insert(fingerprint.clone(), Instant::now());
                 let log = tokio::task::spawn_blocking(crate::diagnostics::own_log)
                     .await
                     .unwrap_or_default();
@@ -1004,6 +1022,14 @@ impl Handler {
                 return;
             }
         };
+        // the sender keeps to this too; a device that doesn't is turned down
+        let total =
+            serde_json::from_slice::<transfer::Offer>(offer).map_or(u64::MAX, |o| o.total_bytes());
+        if total > MAX_CLIPBOARD_FILES {
+            transfer::refuse_offer(tls, "too much for the clipboard").await;
+            log::warn!("refused {total} bytes of copied files from {addr}: too much");
+            return;
+        }
         // only the latest copy is kept
         let _ = std::fs::remove_dir_all(&dir);
         let saved = match transfer::receive(tls, offer, &dir, None, |_| {}).await {
@@ -1041,6 +1067,14 @@ impl Handler {
         if update::is_current(&version) {
             transfer::refuse_offer(tls, "already up to date").await;
             return refuse("already running it".into()).await;
+        }
+        // one zip of a reasonable size, nothing else
+        let shape = serde_json::from_slice::<transfer::Offer>(offer)
+            .map_err(|e| e.to_string())
+            .and_then(|o| update::check_offer(&o));
+        if let Err(e) = shape {
+            transfer::refuse_offer(tls, &e).await;
+            return refuse(e).await;
         }
         let Some(dir) = update::staging_dir() else {
             transfer::refuse_offer(tls, "no place to put it").await;
@@ -1583,6 +1617,7 @@ mod tests {
                     clipboard_enabled: Rc::new(Cell::new(true)),
                     peer_clipboard: Default::default(),
                     event_tx,
+                    log_requests: Default::default(),
                 };
                 let (mut client, mut server) = duplex(1024);
                 write_frame(&mut client, KIND_CLIPBOARD, b"secret")
@@ -1612,6 +1647,7 @@ mod tests {
                     clipboard_enabled: Rc::new(Cell::new(true)),
                     peer_clipboard: Default::default(),
                     event_tx,
+                    log_requests: Default::default(),
                 };
                 let offer = transfer::Offer {
                     id: 99,
@@ -1674,6 +1710,7 @@ mod tests {
                     clipboard_enabled: Rc::new(Cell::new(true)),
                     peer_clipboard: Default::default(),
                     event_tx,
+                    log_requests: Default::default(),
                 };
                 let selection = transfer::select(&[base.join("src/note.txt")]).unwrap();
                 let offer = transfer::Offer {
@@ -1714,6 +1751,7 @@ mod tests {
                     clipboard_enabled: Rc::new(Cell::new(true)),
                     peer_clipboard: Default::default(),
                     event_tx,
+                    log_requests: Default::default(),
                 };
                 let addr = SocketAddr::new([127, 0, 0, 1].into(), 1);
                 // only the header is sent: a pairing request claiming 1 GB
@@ -1771,6 +1809,7 @@ mod tests {
             clipboard_enabled: Rc::new(Cell::new(false)),
             peer_clipboard: Default::default(),
             event_tx,
+            log_requests: Default::default(),
         };
         for _ in 0..MAX_EXCHANGES {
             handler.count_exchange().expect("within the limit");

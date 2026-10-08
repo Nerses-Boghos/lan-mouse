@@ -28,6 +28,30 @@ pub(crate) fn mac_build(arch: &str) -> Option<(PathBuf, String)> {
     (zip.is_file() && !version.is_empty()).then(|| (zip, version.to_owned()))
 }
 
+/// Largest update taken (a Mac build is about 16 MB).
+pub(crate) const MAX_UPDATE: u64 = 256 * 1024 * 1024;
+
+/// An update is one zip file of a reasonable size.
+pub(crate) fn check_offer(offer: &crate::transfer::Offer) -> Result<(), String> {
+    match offer.entries.as_slice() {
+        [entry]
+            if entry.kind == crate::transfer::EntryKind::File
+                && entry.path.ends_with(".zip")
+                && !entry.path.contains('/') =>
+        {
+            if entry.size > MAX_UPDATE {
+                Err(format!(
+                    "an update of {} MB is too big",
+                    entry.size / 1_000_000
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err("an update is one zip file".into()),
+    }
+}
+
 /// Where an incoming update is put before installing it.
 pub(crate) fn staging_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
@@ -89,6 +113,18 @@ pub(crate) fn install(zip: &Path) -> Result<(), String> {
             .arg(format!("-R={required}"))
             .arg(&new))
         .map_err(|e| format!("not signed like the installed Lan Mouse: {e}"))?;
+        // never back to an older build (with problems fixed since)
+        let output = Command::new(new.join("Contents/MacOS/lan-mouse"))
+            .arg("--version")
+            .output()
+            .map_err(|e| e.to_string())?;
+        let built = build_time_of(&String::from_utf8_lossy(&output.stdout))
+            .ok_or("the update doesn't say when it was built")?;
+        if is_older(&built, crate::config::build_time()) {
+            return Err(format!(
+                "the update is older than this version (built {built})"
+            ));
+        }
 
         let old = folder.join(".Lan Mouse.app.old");
         let _ = std::fs::remove_dir_all(&old);
@@ -102,6 +138,50 @@ pub(crate) fn install(zip: &Path) -> Result<(), String> {
     })();
     let _ = std::fs::remove_dir_all(&work);
     result
+}
+
+/// The build time in `--version` output ("build_time:2026-10-06 18:47:25 +00:00").
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn build_time_of(version: &str) -> Option<String> {
+    version
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("build_time:"))
+        .map(|t| t.trim().to_owned())
+}
+
+/// Whether build time `a` is before `b` (both as `--version` prints them,
+/// each with its own UTC offset). Unreadable times count as older.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_older(a: &str, b: &str) -> bool {
+    match (utc_seconds(a), utc_seconds(b)) {
+        (Some(a), Some(b)) => a < b,
+        _ => true,
+    }
+}
+
+/// "2026-10-06 18:47:25 +03:00" as seconds since 1970 (UTC).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn utc_seconds(time: &str) -> Option<i64> {
+    let mut parts = time.split_whitespace();
+    let (date, clock, offset) = (parts.next()?, parts.next()?, parts.next()?);
+    let num = |s: &str| s.parse::<i64>().ok();
+    let d: Vec<i64> = date.split('-').map(num).collect::<Option<_>>()?;
+    let c: Vec<i64> = clock.split(':').map(num).collect::<Option<_>>()?;
+    let (sign, off) = offset.split_at(1);
+    let o: Vec<i64> = off.split(':').map(num).collect::<Option<_>>()?;
+    let ([y, m, day], [hh, mm, ss], [oh, om]) = (d.as_slice(), c.as_slice(), o.as_slice()) else {
+        return None;
+    };
+    // days since 1970-01-01 (Howard Hinnant's days_from_civil)
+    let y = if *m <= 2 { y - 1 } else { *y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let offset = (oh * 3600 + om * 60) * if sign == "-" { -1 } else { 1 };
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss - offset)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -174,6 +254,52 @@ mod tests {
         assert!(mac_build("riscv64").is_none());
         unsafe { std::env::remove_var(BUILDS_ENV) };
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn updates_are_one_zip_of_reasonable_size() {
+        use crate::transfer::{Entry, EntryKind, Offer};
+        let offer = |entries: Vec<Entry>| Offer {
+            id: 1,
+            entries,
+            on_drop: false,
+            release_drops: false,
+            update: Some("abcdef12".into()),
+            clipboard: false,
+        };
+        let file = |path: &str, size| Entry {
+            path: path.into(),
+            kind: EntryKind::File,
+            size,
+        };
+        assert!(check_offer(&offer(vec![file("lan-mouse-macos-arm64.zip", 16_000_000)])).is_ok());
+        assert!(check_offer(&offer(vec![file("a.zip", MAX_UPDATE + 1)])).is_err());
+        assert!(check_offer(&offer(vec![file("evil.sh", 10)])).is_err());
+        assert!(check_offer(&offer(vec![file("a/b.zip", 10)])).is_err());
+        assert!(check_offer(&offer(vec![file("a.zip", 10), file("b.zip", 10)])).is_err());
+        assert!(check_offer(&offer(vec![])).is_err());
+    }
+
+    #[test]
+    fn older_builds_are_refused() {
+        let version = "lan-mouse 0.11.0\nbranch:cursor-position\ncommit_hash:2c941ab1\nbuild_time:2026-10-06 18:47:25 +00:00\n";
+        let built = build_time_of(version).unwrap();
+        assert_eq!(built, "2026-10-06 18:47:25 +00:00");
+        assert!(is_older(&built, "2026-10-08 10:00:00 +00:00"));
+        assert!(!is_older("2026-10-09 00:00:00 +00:00", &built));
+        assert!(build_time_of("lan-mouse 0.11.0").is_none());
+        // the same moment in two time zones is not older
+        assert!(!is_older(
+            "2026-10-09 00:38:25 +03:00",
+            "2026-10-08 21:38:25 +00:00"
+        ));
+        assert!(is_older(
+            "2026-10-09 00:38:24 +03:00",
+            "2026-10-08 21:38:25 +00:00"
+        ));
+        assert_eq!(utc_seconds("1970-01-01 00:00:00 +00:00"), Some(0));
+        assert_eq!(utc_seconds("2000-03-01 00:00:00 +00:00"), Some(951_868_800));
+        assert!(is_older("garbage", "2026-10-08 21:38:25 +00:00"));
     }
 
     #[test]

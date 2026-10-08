@@ -31,6 +31,11 @@ shadow!(build);
 /// in [`lan_mouse_proto::ProtoEvent::Hello`]. Pads with `'?'` if
 /// shadow_rs returns an unexpected length so the field is always
 /// well-formed on the wire.
+/// When this build was made, as `--version` prints it ("2026-10-06 18:47:25 +00:00").
+pub fn build_time() -> &'static str {
+    build::BUILD_TIME
+}
+
 pub fn local_commit() -> [u8; 8] {
     let bytes = build::SHORT_COMMIT.as_bytes();
     let mut out = [b'?'; 8];
