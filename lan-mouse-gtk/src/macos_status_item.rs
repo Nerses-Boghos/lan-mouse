@@ -22,10 +22,42 @@ struct StatusItem {
     _hold: gio::ApplicationHoldGuard,
     _delegate: Id,
     _status_item: Id,
+    /// the first line of the menu: what's going on
+    status_line: Id,
+    /// "Pause sharing" / "Resume sharing"
+    pause_item: Id,
 }
 
 thread_local! {
     static STATUS_ITEM: RefCell<Option<StatusItem>> = const { RefCell::new(None) };
+    static PAUSE_HANDLER: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// What "Pause sharing" / "Resume sharing" does.
+pub fn on_pause(handler: impl Fn() + 'static) {
+    PAUSE_HANDLER.with(|h| h.replace(Some(Box::new(handler))));
+}
+
+/// Show `status` at the top of the menu, and whether sharing is paused.
+pub fn set_status(status: &str, paused: bool) {
+    let Ok(status) = CString::new(status) else {
+        return;
+    };
+    STATUS_ITEM.with(|item| {
+        let item = item.borrow();
+        let Some(item) = item.as_ref() else {
+            return;
+        };
+        unsafe {
+            msg_send_void_id(item.status_line, sel(c"setTitle:"), nsstring(&status));
+            let pause = if paused {
+                c"Resume sharing"
+            } else {
+                c"Pause sharing"
+            };
+            msg_send_void_id(item.pause_item, sel(c"setTitle:"), nsstring(pause));
+        }
+    });
 }
 
 pub fn setup(app: &adw::Application, window: &Window) {
@@ -52,11 +84,19 @@ pub fn setup(app: &adw::Application, window: &Window) {
             msg_send_bool_usize(ns_app, sel(c"setActivationPolicy:"), 1);
 
             let delegate = new_delegate();
+            let status_line = menu_item(c"Lan Mouse", c"showLanMouse:");
+            let pause_item = menu_item(c"Pause sharing", c"togglePause:");
             let menu = menu(&[
+                status_line,
+                separator_item(),
+                pause_item,
                 menu_item(c"Open Lan Mouse", c"showLanMouse:"),
                 separator_item(),
                 menu_item(c"Quit Lan Mouse", c"quitLanMouse:"),
             ]);
+            // the status line is information, not an action
+            msg_send_void_bool(menu, sel(c"setAutoenablesItems:"), 0);
+            msg_send_void_bool(status_line, sel(c"setEnabled:"), 0);
 
             let status_bar = msg_send_id(class(c"NSStatusBar"), sel(c"systemStatusBar"));
             assert!(
@@ -88,6 +128,8 @@ pub fn setup(app: &adw::Application, window: &Window) {
                 _hold: hold,
                 _delegate: delegate,
                 _status_item: status_item,
+                status_line,
+                pause_item,
             }));
         }
     });
@@ -198,6 +240,12 @@ fn delegate_class() -> Class {
         );
         class_addMethod(
             class,
+            sel(c"togglePause:"),
+            toggle_pause as *const c_void,
+            c"v@:@".as_ptr(),
+        );
+        class_addMethod(
+            class,
             sel(c"quitLanMouse:"),
             quit_lan_mouse as *const c_void,
             c"v@:@".as_ptr(),
@@ -268,6 +316,14 @@ unsafe fn install_reopen_handler(delegate: Id) {
         K_CORE_EVENT_CLASS,
         K_AE_REOPEN_APPLICATION,
     );
+}
+
+extern "C" fn toggle_pause(_this: Id, _cmd: Sel, _sender: Id) {
+    PAUSE_HANDLER.with(|h| {
+        if let Some(handler) = h.borrow().as_ref() {
+            handler();
+        }
+    });
 }
 
 extern "C" fn quit_lan_mouse(_this: Id, _cmd: Sel, _sender: Id) {

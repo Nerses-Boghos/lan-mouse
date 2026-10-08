@@ -445,7 +445,7 @@ impl Window {
         self.imp().frontend_request_writer.replace(Some(writer));
     }
 
-    fn request(&self, request: FrontendRequest) {
+    pub(crate) fn request(&self, request: FrontendRequest) {
         let mut requester = self.imp().frontend_request_writer.borrow_mut();
         let requester = requester.as_mut().unwrap();
         if let Err(e) = requester.request(request) {

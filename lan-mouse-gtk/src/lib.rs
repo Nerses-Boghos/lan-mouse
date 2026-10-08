@@ -4,6 +4,8 @@ mod client_row;
 mod fingerprint_window;
 mod key_object;
 mod key_row;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod macos_menu;
 #[cfg(target_os = "macos")]
 mod macos_privacy;
 #[cfg(target_os = "macos")]
@@ -320,12 +322,17 @@ fn build_ui(app: &Application) {
         }
     ));
 
+    // the menu bar item follows what happens
+    #[cfg(target_os = "macos")]
+    let menu = macos_menu::track(&window);
     glib::spawn_future_local(clone!(
         #[weak]
         window,
         async move {
             loop {
                 let notify = receiver.recv().await.unwrap_or_else(|_| process::exit(1));
+                #[cfg(target_os = "macos")]
+                menu.event(&notify);
                 match notify {
                     FrontendEvent::Created(handle, client, state) => {
                         window.new_client(handle, client, state)
