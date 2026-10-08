@@ -241,6 +241,9 @@ jobs:
 
   release:
     name: "Release"
+    # Only a version tag publishes a release; builds of a branch stay build
+    # artifacts (nothing is published before the project goes public).
+    if: startsWith(github.ref, 'refs/tags/')
     # publishing a release needs to write to the repository
     permissions:
       contents: write
