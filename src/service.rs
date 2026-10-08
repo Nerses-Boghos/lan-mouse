@@ -4,7 +4,7 @@ use crate::{
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     control::{Control, ControlEvent, Destination, Layout, PairReply, PairRequest},
-    crypto,
+    crypto, diagnostics,
     discovery::{self, Discovery},
     dns::{DnsEvent, DnsResolver},
     drag,
@@ -370,6 +370,7 @@ impl Service {
                 self.save_config();
                 self.notify_frontend(FrontendEvent::ClipboardStatus(enabled));
             }
+            FrontendRequest::FetchLog { fingerprint } => self.fetch_log(fingerprint),
             FrontendRequest::SetExitShortcut { enabled, keys } => {
                 self.set_exit_shortcut(enabled, keys)
             }
@@ -605,6 +606,34 @@ impl Service {
 
     fn handle_control_event(&mut self, event: ControlEvent) {
         match event {
+            ControlEvent::PeerLog {
+                fingerprint,
+                result,
+            } => {
+                let name = self.device_name(&fingerprint);
+                let saved = result.and_then(|log| {
+                    let path = diagnostics::peer_log_path(&name).ok_or("no cache folder")?;
+                    std::fs::create_dir_all(path.parent().expect("folder"))
+                        .and_then(|()| std::fs::write(&path, log))
+                        .map_err(|e| e.to_string())?;
+                    Ok(path)
+                });
+                let (path, error) = match saved {
+                    Ok(path) => {
+                        log::info!("saved the log of {name} to {}", path.display());
+                        (Some(path.display().to_string()), None)
+                    }
+                    Err(e) => {
+                        log::warn!("could not get the log of {name}: {e}");
+                        (None, Some(e))
+                    }
+                };
+                self.notify_frontend(FrontendEvent::PeerLog {
+                    fingerprint,
+                    path,
+                    error,
+                });
+            }
             ControlEvent::Updated { version } => {
                 log::info!("restarting to run the update {version}");
                 update::restart_app();
@@ -930,23 +959,7 @@ impl Service {
     /// Send files to the paired device with `fingerprint`: to where it is
     /// announced on the network, or else where it is connected.
     fn send_files(&mut self, id: u64, fingerprint: String, paths: Vec<std::path::PathBuf>) {
-        let announced = self
-            .discovery
-            .as_ref()
-            .and_then(|d| d.get(&fingerprint))
-            .and_then(|p| p.ips.first().map(|&ip| SocketAddr::new(ip, p.port)));
-        let client = self.client_manager.find_by_fingerprint(&fingerprint);
-        let connected = || self.client_manager.active_addr(client?);
-        // last resort, as for input: its host name (e.g. after a network
-        // change, before it is announced again)
-        let by_name = || {
-            let (config, _) = self.client_manager.get_state(client?)?;
-            Some(Destination::Host(config.hostname?, config.port))
-        };
-        let addr = announced
-            .or_else(connected)
-            .map(Destination::Addr)
-            .or_else(by_name);
+        let addr = self.destination(&fingerprint);
         let paired = self
             .authorized_keys
             .read()
@@ -1031,6 +1044,46 @@ impl Service {
             Some(drag),
             release_drops,
         );
+    }
+
+    /// Where to reach the device with `fingerprint` on the control channel:
+    /// where it is announced on the network, or else where it is connected,
+    /// or else its host name.
+    fn destination(&self, fingerprint: &str) -> Option<Destination> {
+        let announced = self
+            .discovery
+            .as_ref()
+            .and_then(|d| d.get(fingerprint))
+            .and_then(|p| p.ips.first().map(|&ip| SocketAddr::new(ip, p.port)));
+        let client = self.client_manager.find_by_fingerprint(fingerprint);
+        let connected = || self.client_manager.active_addr(client?);
+        // last resort, as for input: its host name (e.g. after a network
+        // change, before it is announced again)
+        let by_name = || {
+            let (config, _) = self.client_manager.get_state(client?)?;
+            Some(Destination::Host(config.hostname?, config.port))
+        };
+        announced
+            .or_else(connected)
+            .map(Destination::Addr)
+            .or_else(by_name)
+    }
+
+    /// Ask a paired device for its log, saved for a problem report.
+    fn fetch_log(&mut self, fingerprint: String) {
+        let problem = match (&self.control, self.destination(&fingerprint)) {
+            (None, _) => "the control channel is unavailable".to_owned(),
+            (_, None) => "the device isn't on the network".to_owned(),
+            (Some(control), Some(destination)) => {
+                control.fetch_log(destination, fingerprint);
+                return;
+            }
+        };
+        self.notify_frontend(FrontendEvent::PeerLog {
+            fingerprint,
+            path: None,
+            error: Some(problem),
+        });
     }
 
     /// What the user calls the device with `fingerprint`.

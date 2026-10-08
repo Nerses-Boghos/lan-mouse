@@ -128,6 +128,9 @@ enum CliSubcommand {
         action: String,
         keys: Option<String>,
     },
+    /// fetch the recent log of the paired device with this fingerprint and
+    /// print where it was saved
+    PeerLog { fingerprint: String },
     /// re-enable capture
     EnableCapture,
     /// re-enable emulation
@@ -276,6 +279,33 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     }
                     FrontendEvent::Error(e) => return Err(CliError::Failed(e)),
                     _ => {}
+                }
+            }
+        }
+        CliSubcommand::PeerLog { fingerprint } => {
+            tx.request(FrontendRequest::FetchLog {
+                fingerprint: fingerprint.clone(),
+            })
+            .await?;
+            while let Some(e) = rx.next().await {
+                if let FrontendEvent::PeerLog {
+                    fingerprint: f,
+                    path,
+                    error,
+                } = e?
+                {
+                    if f != fingerprint {
+                        continue;
+                    }
+                    match (path, error) {
+                        (Some(path), _) => println!("{path}"),
+                        (None, error) => {
+                            return Err(CliError::Failed(
+                                error.unwrap_or_else(|| "no log".to_owned()),
+                            ));
+                        }
+                    }
+                    break;
                 }
             }
         }

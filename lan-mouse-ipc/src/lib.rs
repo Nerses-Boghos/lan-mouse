@@ -316,6 +316,13 @@ pub enum FrontendEvent {
     /// the keys bringing the cursor back to this device (e.g. "Esc Esc
     /// Esc"), and whether they work
     ExitShortcut { enabled: bool, keys: String },
+    /// the log asked for with [`FrontendRequest::FetchLog`], saved at
+    /// `path`, or why it couldn't be had
+    PeerLog {
+        fingerprint: String,
+        path: Option<String>,
+        error: Option<String>,
+    },
     /// a device asks to pair; answer with [`FrontendRequest::PairResponse`].
     /// `pos` is where the requesting device will be relative to this one.
     PairRequest {
@@ -419,6 +426,9 @@ pub enum FrontendRequest {
     /// switch the exit shortcut on or off and change its keys (`None`:
     /// keep them); written like "Esc Esc Esc" or "Ctrl+Shift+Super+Alt"
     SetExitShortcut { enabled: bool, keys: Option<String> },
+    /// get the recent log of the paired device with this fingerprint (for
+    /// a problem report); answered with [`FrontendEvent::PeerLog`]
+    FetchLog { fingerprint: String },
     /// send files and folders (absolute paths) to the paired device with
     /// this fingerprint; `id` identifies the transfer in its updates
     SendFiles {

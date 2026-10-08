@@ -6,6 +6,7 @@ pub mod config;
 mod connect;
 mod control;
 mod crypto;
+mod diagnostics;
 mod discovery;
 mod dns;
 mod drag;

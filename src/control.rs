@@ -68,6 +68,10 @@ const KIND_PAIR_CONFIRM: u8 = 7;
 /// Sent instead of a commitment while pairing attempts are rate limited.
 const KIND_PAIR_BUSY: u8 = 8;
 const KIND_LAYOUT: u8 = 9;
+/// A paired device asks for this one's recent log (for a problem report).
+const KIND_LOG_REQUEST: u8 = 18;
+/// The answer to [`KIND_LOG_REQUEST`].
+const KIND_LOG: u8 = 19;
 
 /// Largest [`Layout`] accepted: a few monitors are a few hundred bytes.
 const MAX_LAYOUT_SIZE: usize = 64 * 1024;
@@ -220,6 +224,11 @@ pub(crate) enum ControlEvent {
         fingerprint: String,
         version: String,
         result: Result<(), String>,
+    },
+    /// The log asked for with [`Control::fetch_log`].
+    PeerLog {
+        fingerprint: String,
+        result: Result<String, String>,
     },
     /// A pairing started with [`Control::pair`] completed.
     Finished {
@@ -499,6 +508,39 @@ impl Control {
         });
     }
 
+    /// Ask the paired device at `destination` with this `fingerprint` for
+    /// its recent log; it comes as [`ControlEvent::PeerLog`].
+    pub(crate) fn fetch_log(&self, destination: Destination, fingerprint: String) {
+        let connector = self.connector.clone();
+        let authorized_keys = self.authorized_keys.clone();
+        let event_tx = self.event_tx.clone();
+        spawn_local(async move {
+            let fetching = async {
+                let addr = destination.resolve().await?;
+                let (mut tls, peer) = connect(&connector, addr).await.map_err(|e| e.to_string())?;
+                if peer != fingerprint {
+                    return Err(ControlError::WrongPeer(peer).to_string());
+                }
+                check_authorized(&peer, &authorized_keys).map_err(|e| e.to_string())?;
+                write_frame(&mut tls, KIND_LOG_REQUEST, &[])
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // collecting it may take a moment over there
+                let log =
+                    tokio::time::timeout(Duration::from_secs(30), read_frame(&mut tls, KIND_LOG))
+                        .await
+                        .map_err(|_| "it didn't answer (an older version?)".to_owned())?
+                        .map_err(|e| e.to_string())?;
+                Ok::<_, String>(String::from_utf8_lossy(&log).into_owned())
+            };
+            let result = fetching.await;
+            let _ = event_tx.send(ControlEvent::PeerLog {
+                fingerprint,
+                result,
+            });
+        });
+    }
+
     /// Send the build `zip` (Lan Mouse `version`) to the paired device at
     /// `destination` with this `fingerprint`, which installs it if signed
     /// like its own; the outcome comes as [`ControlEvent::UpdateSent`].
@@ -645,14 +687,18 @@ impl Handler {
         // Decide what this peer may send before reading (and allocating) it.
         let paired = check_authorized(&fingerprint, &self.authorized_keys).is_ok();
         match kind {
-            KIND_CLIPBOARD | KIND_LAYOUT | transfer::KIND_OFFER if !paired => {
+            KIND_CLIPBOARD | KIND_LAYOUT | KIND_LOG_REQUEST | transfer::KIND_OFFER if !paired => {
                 return Err(ControlError::Unauthorized(fingerprint));
             }
             KIND_LAYOUT if len > MAX_LAYOUT_SIZE => return Err(ControlError::TooLarge(len)),
             transfer::KIND_OFFER if len > transfer::MAX_OFFER_SIZE => {
                 return Err(ControlError::TooLarge(len));
             }
-            KIND_CLIPBOARD | KIND_LAYOUT | KIND_PAIR_REQUEST | transfer::KIND_OFFER => {}
+            KIND_CLIPBOARD
+            | KIND_LAYOUT
+            | KIND_LOG_REQUEST
+            | KIND_PAIR_REQUEST
+            | transfer::KIND_OFFER => {}
             kind => return Err(ControlError::UnexpectedKind(kind)),
         }
         let limit = if paired { MAX_SIZE } else { MAX_UNPAIRED_SIZE };
@@ -681,6 +727,15 @@ impl Handler {
                     Some(version) => self.receive_update(tls, &payload, version, addr).await,
                     None => self.receive_files(tls, &payload, fingerprint, addr).await,
                 }
+                Ok(())
+            }
+            KIND_LOG_REQUEST => {
+                let log = tokio::task::spawn_blocking(crate::diagnostics::own_log)
+                    .await
+                    .unwrap_or_default();
+                log::info!("sending this device's log to {addr}");
+                write_frame(tls, KIND_LOG, log.as_bytes()).await?;
+                tls.shutdown().await?;
                 Ok(())
             }
             KIND_LAYOUT => {
