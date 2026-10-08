@@ -167,6 +167,10 @@ pub struct ClientConfig {
     /// two devices exchange theirs.
     #[serde(default)]
     pub arranged_at: Option<u64>,
+    /// Addresses the device said it has (on every network it's on, e.g.
+    /// Tailscale too): tried when it isn't found on the local network.
+    #[serde(default)]
+    pub known_ips: Vec<IpAddr>,
 }
 
 impl Default for ClientConfig {
@@ -181,6 +185,7 @@ impl Default for ClientConfig {
             offset: None,
             fingerprint: None,
             arranged_at: None,
+            known_ips: Vec::new(),
         }
     }
 }

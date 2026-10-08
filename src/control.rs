@@ -48,6 +48,30 @@ use crate::{
     crypto, transfer, update,
 };
 
+/// This device's addresses on all its networks.
+fn own_addresses() -> Vec<std::net::IpAddr> {
+    if_addrs::get_if_addrs()
+        .map(|ifs| ifs.into_iter().map(|i| i.ip()).collect())
+        .unwrap_or_default()
+}
+
+/// The addresses worth trying from elsewhere: not this machine's own
+/// (loopback), nor ones only valid on one link; at most [`MAX_ADDRESSES`].
+fn reachable(ips: Vec<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
+    let mut ips: Vec<_> = ips
+        .into_iter()
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast())
+        .filter(|ip| match ip {
+            std::net::IpAddr::V4(v4) => !v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 != 0xfe80,
+        })
+        .collect();
+    ips.sort();
+    ips.dedup();
+    ips.truncate(MAX_ADDRESSES);
+    ips
+}
+
 /// Where files dragged over from another device wait for their drop.
 fn dragged_files_dir() -> Option<std::path::PathBuf> {
     clipboard_files_dir().map(|dir| dir.with_file_name("drag"))
@@ -94,6 +118,11 @@ const KIND_LOG_REQUEST: u8 = 18;
 const KIND_LOG: u8 = 19;
 /// A copied image (PNG) for the receiver's clipboard.
 const KIND_CLIPBOARD_IMAGE: u8 = 20;
+/// The sender's addresses on all its networks (JSON list), for reaching
+/// it when it isn't found on the local one.
+const KIND_ADDRESSES: u8 = 21;
+/// Most addresses a device may tell.
+const MAX_ADDRESSES: usize = 16;
 /// Most copied files sent along at a crossing; more would hold up every
 /// crossing (dragging still carries them).
 const MAX_CLIPBOARD_FILES: u64 = 512 * 1024 * 1024;
@@ -249,6 +278,11 @@ pub(crate) enum ControlEvent {
         fingerprint: String,
         version: String,
         result: Result<(), String>,
+    },
+    /// A paired device told its addresses (see [`KIND_ADDRESSES`]).
+    Addresses {
+        fingerprint: String,
+        ips: Vec<std::net::IpAddr>,
     },
     /// The log asked for with [`Control::fetch_log`].
     PeerLog {
@@ -591,6 +625,30 @@ impl Control {
         });
     }
 
+    /// Tell the paired device at `addr` with this `fingerprint` this
+    /// device's addresses on all its networks, in the background.
+    pub(crate) fn send_addresses(&self, addr: SocketAddr, fingerprint: String) {
+        let connector = self.connector.clone();
+        let authorized_keys = self.authorized_keys.clone();
+        spawn_local(async move {
+            let ips = reachable(own_addresses());
+            let sending = async {
+                let (mut tls, peer) = connect(&connector, addr).await?;
+                if peer != fingerprint {
+                    return Err(ControlError::WrongPeer(peer));
+                }
+                check_authorized(&peer, &authorized_keys)?;
+                write_frame(&mut tls, KIND_ADDRESSES, &serde_json::to_vec(&ips)?).await?;
+                tls.shutdown().await?;
+                Ok(())
+            };
+            match timeout(TIMEOUT, sending).await {
+                Ok(()) => log::info!("told {addr} this device's {} addresses", ips.len()),
+                Err(e) => log::warn!("could not tell {addr} this device's addresses: {e}"),
+            }
+        });
+    }
+
     /// Ask the paired device at `destination` with this `fingerprint` for
     /// its recent log; it comes as [`ControlEvent::PeerLog`].
     pub(crate) fn fetch_log(&self, destination: Destination, fingerprint: String) {
@@ -780,6 +838,7 @@ impl Handler {
             | KIND_CLIPBOARD_IMAGE
             | KIND_LAYOUT
             | KIND_LOG_REQUEST
+            | KIND_ADDRESSES
             | transfer::KIND_OFFER
                 if !paired =>
             {
@@ -789,10 +848,12 @@ impl Handler {
             transfer::KIND_OFFER if len > transfer::MAX_OFFER_SIZE => {
                 return Err(ControlError::TooLarge(len));
             }
+            KIND_ADDRESSES if len > MAX_LAYOUT_SIZE => return Err(ControlError::TooLarge(len)),
             KIND_CLIPBOARD
             | KIND_CLIPBOARD_IMAGE
             | KIND_LAYOUT
             | KIND_LOG_REQUEST
+            | KIND_ADDRESSES
             | KIND_PAIR_REQUEST
             | transfer::KIND_OFFER => {}
             kind => return Err(ControlError::UnexpectedKind(kind)),
@@ -862,6 +923,14 @@ impl Handler {
                 log::info!("sending this device's log to {addr}");
                 write_frame(tls, KIND_LOG, log.as_bytes()).await?;
                 tls.shutdown().await?;
+                Ok(())
+            }
+            KIND_ADDRESSES => {
+                let ips: Vec<std::net::IpAddr> = serde_json::from_slice(&payload)?;
+                let ips = reachable(ips);
+                let _ = self
+                    .event_tx
+                    .send(ControlEvent::Addresses { fingerprint, ips });
                 Ok(())
             }
             KIND_LAYOUT => {
@@ -1737,6 +1806,34 @@ mod tests {
             assert!(!downloads.join("note.txt").exists() || base.starts_with(&downloads));
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn only_addresses_reachable_from_elsewhere_are_told() {
+        let ips: Vec<std::net::IpAddr> = [
+            "127.0.0.1",
+            "192.168.1.8",
+            "100.101.102.103",
+            "169.254.1.2",
+            "::1",
+            "fe80::1",
+            "fd7a:115c:a1e0::1",
+            "0.0.0.0",
+            "192.168.1.8",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let told: Vec<String> = reachable(ips).iter().map(|ip| ip.to_string()).collect();
+        assert_eq!(
+            told,
+            ["100.101.102.103", "192.168.1.8", "fd7a:115c:a1e0::1"]
+        );
+        // never more than a handful
+        let many = (0..100u8)
+            .map(|i| std::net::IpAddr::from([10, 0, 0, i]))
+            .collect();
+        assert_eq!(reachable(many).len(), MAX_ADDRESSES);
     }
 
     #[tokio::test]

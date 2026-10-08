@@ -99,6 +99,8 @@ struct TomlClient {
     fingerprint: Option<String>,
     /// when the arrangement last changed (ms since the Unix epoch)
     arranged_at: Option<u64>,
+    /// addresses the device said it has, see `ClientConfig::known_ips`
+    known_ips: Option<Vec<IpAddr>>,
 }
 
 impl ConfigToml {
@@ -298,6 +300,7 @@ pub struct ConfigClient {
     pub offset: Option<i32>,
     pub fingerprint: Option<String>,
     pub arranged_at: Option<u64>,
+    pub known_ips: Vec<IpAddr>,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -320,6 +323,7 @@ impl From<TomlClient> for ConfigClient {
             offset: toml.offset,
             fingerprint: toml.fingerprint,
             arranged_at: toml.arranged_at,
+            known_ips: toml.known_ips.unwrap_or_default(),
         }
     }
 }
@@ -352,6 +356,7 @@ impl From<ConfigClient> for TomlClient {
             offset: client.offset,
             fingerprint: client.fingerprint,
             arranged_at: client.arranged_at,
+            known_ips: (!client.known_ips.is_empty()).then_some(client.known_ips),
         }
     }
 }

@@ -417,6 +417,7 @@ impl Service {
                 offset: c.offset,
                 fingerprint: c.fingerprint,
                 arranged_at: c.arranged_at,
+                known_ips: c.known_ips,
             })
             .collect();
         self.config.set_clients(clients);
@@ -627,6 +628,19 @@ impl Service {
 
     fn handle_control_event(&mut self, event: ControlEvent) {
         match event {
+            ControlEvent::Addresses { fingerprint, ips } => {
+                let Some(handle) = self.client_manager.find_by_fingerprint(&fingerprint) else {
+                    return;
+                };
+                if self.client_manager.set_known_ips(handle, ips.clone()) {
+                    log::info!(
+                        "{} can also be reached at {ips:?}",
+                        self.device_name(&fingerprint)
+                    );
+                    self.save_config();
+                    self.broadcast_client(handle);
+                }
+            }
             ControlEvent::PeerLog {
                 fingerprint,
                 result,
@@ -1295,8 +1309,17 @@ impl Service {
             offset: config.offset.map(|o| -o),
             arranged_at: config.arranged_at.unwrap_or(0),
         };
-        control.send_layout(addr, fingerprint, layout);
+        control.send_layout(addr, fingerprint.clone(), layout);
         self.layout_sent.insert(handle, addr);
+        // and where to find this device when it's on another network
+        let understood = self
+            .discovery
+            .as_ref()
+            .and_then(|d| d.get(&fingerprint))
+            .is_some_and(|p| p.features.iter().any(|f| f == discovery::ADDRESSES));
+        if understood {
+            control.send_addresses(addr, fingerprint);
+        }
     }
 
     /// A client that just connected (at a new address) gets our layout.

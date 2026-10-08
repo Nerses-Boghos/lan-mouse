@@ -1771,6 +1771,7 @@ dependencies = [
  "clap",
  "env_logger",
  "futures",
+ "if-addrs",
  "input-capture",
  "input-emulation",
  "input-event",

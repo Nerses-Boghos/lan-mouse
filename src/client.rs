@@ -66,10 +66,16 @@ impl ClientManager {
             offset: config_client.offset,
             fingerprint: config_client.fingerprint,
             arranged_at: config_client.arranged_at,
+            known_ips: config_client.known_ips,
         };
         let state = ClientState {
             active: config_client.active,
-            ips: HashSet::from_iter(config.fix_ips.iter().cloned()),
+            ips: config
+                .fix_ips
+                .iter()
+                .chain(&config.known_ips)
+                .cloned()
+                .collect(),
             ..Default::default()
         };
         let handle = self.add_client();
@@ -206,6 +212,20 @@ impl ClientManager {
         self.update_ips(handle);
     }
 
+    /// Remember the addresses the device said it has; returns whether
+    /// they changed (then the configuration needs saving).
+    pub fn set_known_ips(&self, handle: ClientHandle, known_ips: Vec<IpAddr>) -> bool {
+        let changed = self
+            .clients
+            .borrow_mut()
+            .get_mut(handle as usize)
+            .is_some_and(|(c, _)| {
+                std::mem::replace(&mut c.known_ips, known_ips.clone()) != known_ips
+            });
+        self.update_ips(handle);
+        changed
+    }
+
     fn update_ips(&self, handle: ClientHandle) {
         if let Some((c, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.ips = c
@@ -213,6 +233,7 @@ impl ClientManager {
                 .iter()
                 .cloned()
                 .chain(s.dns_ips.iter().cloned())
+                .chain(c.known_ips.iter().cloned())
                 .collect::<HashSet<_>>();
         }
     }
@@ -455,5 +476,27 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .map(|(_, s)| s.ips.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remembered_addresses_are_tried_too() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        let lan: IpAddr = "192.168.1.4".parse().unwrap();
+        let tailnet: IpAddr = "100.64.0.7".parse().unwrap();
+        manager.set_dns_ips(handle, vec![lan]);
+        assert!(manager.set_known_ips(handle, vec![tailnet]));
+        let ips = manager.get_ips(handle).unwrap();
+        assert!(ips.contains(&lan) && ips.contains(&tailnet));
+        // not found on the local network: the remembered one remains
+        manager.set_dns_ips(handle, vec![]);
+        assert_eq!(manager.get_ips(handle).unwrap(), HashSet::from([tailnet]));
+        // the same again changes nothing (nothing to save)
+        assert!(!manager.set_known_ips(handle, vec![tailnet]));
     }
 }

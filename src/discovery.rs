@@ -21,9 +21,12 @@ use mdns_sd::{DaemonEvent, IfKind, Receiver, ServiceDaemon, ServiceEvent, Servic
 const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
 /// What this version can do that older ones can't, announced so others only
 /// ask for it where it works: "clipboard-files" takes copied files and
-/// images; "update" takes updates; "log" sends its log.
-pub(crate) const FEATURES: &str = "clipboard-files,update,log";
+/// images; "update" takes updates; "log" sends its log; "addresses" takes
+/// the addresses of devices for reaching them from other networks.
+pub(crate) const FEATURES: &str = "clipboard-files,update,log,addresses";
 pub(crate) const CLIPBOARD_FILES: &str = "clipboard-files";
+/// Takes this device's addresses on other networks (see `KIND_ADDRESSES`).
+pub(crate) const ADDRESSES: &str = "addresses";
 
 /// Bump when the pairing / control protocol changes incompatibly.
 const PROTOCOL_VERSION: &str = "4";
