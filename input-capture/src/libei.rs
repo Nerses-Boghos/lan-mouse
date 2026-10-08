@@ -630,7 +630,14 @@ async fn handle_ei_event(
         EiEvent::DevicePaused(_) | EiEvent::DeviceResumed(_) => {
             log::info!("compositor input device: {ei_event:?}");
         }
-        EiEvent::DeviceAdded(_) => log::info!("compositor input device: {ei_event:?}"),
+        EiEvent::DeviceAdded(_) => {
+            log::info!("compositor input device: {ei_event:?}");
+            if current_client.is_some() {
+                // Hyprland doesn't start a device replaced mid-capture:
+                // its input is lost until the next crossing
+                log::warn!("the compositor replaced an input device while capturing");
+            }
+        }
         EiEvent::DeviceStartEmulating(_) => log::debug!("START EMULATING"),
         EiEvent::DeviceStopEmulating(_) => log::debug!("STOP EMULATING"),
         EiEvent::Disconnected(d) => {
