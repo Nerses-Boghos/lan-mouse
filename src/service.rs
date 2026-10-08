@@ -11,7 +11,7 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     exit_shortcut::Shortcut,
     listen::{LanMouseListener, ListenerCreationError},
-    update,
+    transfer, update,
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
@@ -103,6 +103,12 @@ pub struct Service {
     /// [`Service::wait_for_dragged_files`]
     late_drag_tx: local_channel::mpsc::Sender<(ClientHandle, Vec<std::path::PathBuf>)>,
     late_drag_rx: local_channel::mpsc::Receiver<(ClientHandle, Vec<std::path::PathBuf>)>,
+    /// files dragged over from another device, carried on as a drag on
+    /// this desktop: the transfer's id, and the drag
+    native_drop: Option<(u64, input_capture::NativeDrop)>,
+    /// the drag of this transfer is ready for the button press
+    native_ready_tx: local_channel::mpsc::Sender<u64>,
+    native_ready_rx: local_channel::mpsc::Receiver<u64>,
 }
 
 /// While the keyboard and mouse control another device: a file drag
@@ -179,6 +185,7 @@ impl Service {
 
         let port = config.port();
         let (late_drag_tx, late_drag_rx) = local_channel::mpsc::channel();
+        let (native_ready_tx, native_ready_rx) = local_channel::mpsc::channel();
         let service = Self {
             config,
             capture,
@@ -208,6 +215,9 @@ impl Service {
             visit: None,
             late_drag_tx,
             late_drag_rx,
+            native_drop: None,
+            native_ready_tx,
+            native_ready_rx,
         };
         Ok(service)
     }
@@ -250,6 +260,12 @@ impl Service {
                     checks += 1;
                     if checks.is_multiple_of(6) {
                         self.resolve_unconnected();
+                    }
+                }
+                Some(id) = self.native_ready_rx.recv() => {
+                    // still that drag: press, as the other device's mouse
+                    if self.native_drop.as_ref().is_some_and(|(i, d)| *i == id && !d.finished()) {
+                        self.emulation.press_primary();
                     }
                 }
                 Some((handle, files)) = self.late_drag_rx.recv() => {
@@ -747,6 +763,13 @@ impl Service {
                 if dropped_there && cfg!(not(target_os = "macos")) {
                     self.emulation.release_primary();
                 }
+                // files dragged over from there: a drag on this desktop
+                if update.incoming && update.dragged && cfg!(not(target_os = "macos")) {
+                    if self.carry_on_drag(&mut update) {
+                        self.notify_frontend(FrontendEvent::Transfer(update));
+                    }
+                    return;
+                }
                 self.notify_frontend(FrontendEvent::Transfer(update));
             }
             ControlEvent::Finished {
@@ -1020,6 +1043,80 @@ impl Service {
 
     /// Start sending the files of a drag that just crossed to client
     /// `handle`; they are kept there only if it ends in a drop there.
+    /// Files dragged over from another device are arriving: carry the drag
+    /// on here, as a drag on this desktop that drops on any window. Dropped
+    /// anywhere else, they go to Downloads as before. Returns whether the
+    /// update is still worth showing.
+    fn carry_on_drag(&mut self, update: &mut TransferUpdate) -> bool {
+        let current = self
+            .native_drop
+            .as_ref()
+            .filter(|(id, _)| *id == update.id)
+            .map(|(_, drop)| drop.clone());
+        match &update.state {
+            TransferState::Running => {
+                if current.is_none() {
+                    self.start_native_drop(update.id);
+                }
+                false
+            }
+            TransferState::Done { saved } => {
+                // still under way: dropped on a window, which takes the files
+                if let Some(drop) = current.filter(|d| !d.finished()) {
+                    log::info!(
+                        "handing {} dragged items to where they were dropped",
+                        saved.len()
+                    );
+                    drop.deliver(saved.clone());
+                    return false;
+                }
+                // dropped where nothing takes files: keep them, in Downloads
+                let moved = transfer::downloads_dir()
+                    .ok_or_else(|| std::io::Error::other("no downloads folder"))
+                    .and_then(|dir| transfer::move_into(saved, &dir));
+                update.state = match moved {
+                    Ok(saved) => TransferState::Done { saved },
+                    Err(e) => TransferState::Failed(e.to_string()),
+                };
+                true
+            }
+            TransferState::Cancelled | TransferState::Failed(_) => {
+                if let Some(drop) = current {
+                    drop.cancel();
+                    // and let go of the button pressed for it
+                    self.emulation.release_primary();
+                }
+                self.native_drop = None;
+                matches!(update.state, TransferState::Failed(_))
+            }
+        }
+    }
+
+    /// Put up the drag for transfer `id`; once the pointer is on its overlay
+    /// the button gets pressed (see [`input_capture::NativeDrop`]).
+    fn start_native_drop(&mut self, id: u64) {
+        if let Some((_, old)) = self.native_drop.take() {
+            old.cancel();
+        }
+        let Some(drop) = input_capture::NativeDrop::start() else {
+            return;
+        };
+        self.native_drop = Some((id, drop.clone()));
+        let ready = self.native_ready_tx.clone();
+        tokio::task::spawn_local(async move {
+            for _ in 0..200 {
+                if drop.finished() {
+                    return;
+                }
+                if drop.ready() {
+                    let _ = ready.send(id);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    }
+
     fn carry_drag(&mut self, handle: ClientHandle, files: Vec<std::path::PathBuf>) {
         let Some(fingerprint) = self.client_fingerprint(handle) else {
             log::info!("not carrying the drag: client {handle} isn't paired");

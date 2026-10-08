@@ -48,6 +48,11 @@ use crate::{
     crypto, transfer, update,
 };
 
+/// Where files dragged over from another device wait for their drop.
+fn dragged_files_dir() -> Option<std::path::PathBuf> {
+    clipboard_files_dir().map(|dir| dir.with_file_name("drag"))
+}
+
 /// Where files copied on another device are kept, ready to paste.
 fn clipboard_files_dir() -> Option<std::path::PathBuf> {
     let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
@@ -913,11 +918,21 @@ impl Handler {
     ) where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let Some(dest) = transfer::downloads_dir() else {
-            log::warn!("refusing files from {addr}: no downloads folder");
+        let Ok(header) = serde_json::from_slice::<transfer::Offer>(offer) else {
             return;
         };
-        let Ok(header) = serde_json::from_slice::<transfer::Offer>(offer) else {
+        // A drag here becomes a drag on this desktop (see
+        // [`input_capture::NativeDrop`]): its files stay out of sight until
+        // dropped on a window, or else go to Downloads (see the service).
+        let dest = if header.on_drop && cfg!(not(target_os = "macos")) {
+            dragged_files_dir().inspect(|dir| {
+                let _ = std::fs::remove_dir_all(dir);
+            })
+        } else {
+            transfer::downloads_dir()
+        };
+        let Some(dest) = dest else {
+            log::warn!("refusing files from {addr}: no folder to put them in");
             return;
         };
         let (files, total) = (header.files(), header.total_bytes());
@@ -1171,7 +1186,6 @@ async fn read_frame<S: AsyncRead + Unpin>(
         Err(ControlError::UnexpectedKind(kind))
     }
 }
-
 
 fn peer_fingerprint(certs: Option<&[CertificateDer<'_>]>) -> String {
     certs

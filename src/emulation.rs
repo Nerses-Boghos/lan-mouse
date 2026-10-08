@@ -72,6 +72,9 @@ enum EmulationRequest {
     /// let go of the primary button held for any device (see
     /// [`Emulation::release_primary`])
     ReleasePrimary,
+    /// press the primary button for every device (see
+    /// [`Emulation::press_primary`])
+    PressPrimary,
     /// drop the connections of a device that is no longer authorized
     Disconnect(String),
     ChangePort(u16),
@@ -113,6 +116,14 @@ impl Emulation {
     pub(crate) fn release_primary(&self) {
         self.request_tx
             .send(EmulationRequest::ReleasePrimary)
+            .expect("channel closed");
+    }
+
+    /// Press the primary button, as if the device controlling this one did:
+    /// starts a drag here (see [`input_capture::NativeDrop`]).
+    pub(crate) fn press_primary(&self) {
+        self.request_tx
+            .send(EmulationRequest::PressPrimary)
             .expect("channel closed");
     }
 
@@ -249,6 +260,7 @@ impl ListenTask {
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
                     EmulationRequest::ReleasePrimary => self.emulation_proxy.release_primary(),
+                    EmulationRequest::PressPrimary => self.emulation_proxy.press_primary(),
                     EmulationRequest::Disconnect(fingerprint) => {
                         for addr in self.listener.disconnect(&fingerprint).await {
                             log::info!("disconnected {addr}: no longer authorized");
@@ -299,6 +311,7 @@ enum ProxyRequest {
     Warp(f64, f64, SocketAddr),
     Remove(SocketAddr),
     ReleasePrimary,
+    PressPrimary,
     Terminate,
     Reenable,
 }
@@ -369,6 +382,14 @@ impl EmulationProxy {
         }
     }
 
+    fn press_primary(&self) {
+        if self.emulation_active.get() {
+            self.request_tx
+                .send(ProxyRequest::PressPrimary)
+                .expect("channel closed");
+        }
+    }
+
     fn reenable(&self) {
         self.request_tx
             .send(ProxyRequest::Reenable)
@@ -409,8 +430,9 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) | ProxyRequest::Warp(..) => { /* emulation inactive => ignore */
                     }
-                    ProxyRequest::Remove(..) | ProxyRequest::ReleasePrimary => { /* emulation inactive => ignore */
-                    }
+                    ProxyRequest::Remove(..)
+                    | ProxyRequest::ReleasePrimary
+                    | ProxyRequest::PressPrimary => { /* emulation inactive => ignore */ }
                 }
             }
         }
@@ -491,14 +513,15 @@ impl EmulationTask {
                             emulation.destroy(handle).await;
                         }
                     }
-                    ProxyRequest::ReleasePrimary => {
-                        let release = Event::Pointer(PointerEvent::Button {
+                    request @ (ProxyRequest::ReleasePrimary | ProxyRequest::PressPrimary) => {
+                        let state = u32::from(matches!(request, ProxyRequest::PressPrimary));
+                        let button = Event::Pointer(PointerEvent::Button {
                             time: 0,
                             button: input_event::BTN_LEFT,
-                            state: 0,
+                            state,
                         });
                         for &handle in self.handles.values() {
-                            emulation.consume(release, handle).await?;
+                            emulation.consume(button, handle).await?;
                         }
                     }
                     ProxyRequest::Terminate => break Ok(()),
@@ -690,7 +713,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Warp(..) => continue,
             ProxyRequest::Remove(_) => continue,
-            ProxyRequest::ReleasePrimary => continue,
+            ProxyRequest::ReleasePrimary | ProxyRequest::PressPrimary => continue,
             ProxyRequest::Reenable => continue,
         }
     }

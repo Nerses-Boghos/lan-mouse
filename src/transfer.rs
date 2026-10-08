@@ -370,6 +370,24 @@ fn available_space(dir: &Path) -> Option<u64> {
     }
 }
 
+/// Move `items` into `dir`, renaming like a download when a name is taken;
+/// returns where they are now.
+pub(crate) fn move_into(items: &[PathBuf], dir: &Path) -> io::Result<Vec<PathBuf>> {
+    fs::create_dir_all(dir)?;
+    items
+        .iter()
+        .map(|item| {
+            let name = item
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| io::Error::other("no file name"))?;
+            let to = unique_name(dir, &name);
+            fs::rename(item, &to)?;
+            Ok(to)
+        })
+        .collect()
+}
+
 /// `name` in `dir`, or "name (2)", "name (3)" … if taken, like browsers.
 fn unique_name(dir: &Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);

@@ -68,6 +68,34 @@ pub use wayland_drag::watch_edges as watch_drag_edges;
 #[cfg(not(layer_shell))]
 pub fn watch_drag_edges(_edges: Vec<Position>) {}
 
+#[cfg(layer_shell)]
+mod wayland_drop;
+
+/// A drag on this desktop for files dragged over from another device.
+#[cfg(layer_shell)]
+pub use wayland_drop::NativeDrop;
+
+/// A drag on this desktop for files from another device: not possible
+/// here, so `start` never gives one.
+#[cfg(not(layer_shell))]
+#[derive(Clone)]
+pub struct NativeDrop;
+
+#[cfg(not(layer_shell))]
+impl NativeDrop {
+    pub fn start() -> Option<Self> {
+        None
+    }
+    pub fn ready(&self) -> bool {
+        false
+    }
+    pub fn finished(&self) -> bool {
+        true
+    }
+    pub fn deliver(&self, _files: Vec<std::path::PathBuf>) {}
+    pub fn cancel(&self) {}
+}
+
 /// End a drag carried to another device: nothing to do here.
 #[cfg(not(target_os = "macos"))]
 pub fn end_drag_where_it_started() {}
