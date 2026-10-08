@@ -11,6 +11,7 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     exit_shortcut::Shortcut,
     listen::{LanMouseListener, ListenerCreationError},
+    update,
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
@@ -91,6 +92,9 @@ pub struct Service {
     next_trigger_handle: u64,
     /// connected clients that have our layout, by the address they got it at
     layout_sent: HashMap<ClientHandle, SocketAddr>,
+    /// updates offered to paired devices: version, and when (see
+    /// [`Service::offer_update`])
+    update_offers: HashMap<String, (String, std::time::Instant)>,
     /// this device's monitors, as last sent to other devices
     monitors: Vec<Monitor>,
     /// the current visit to another device, for drags carried there
@@ -113,6 +117,8 @@ struct Visit {
 
 /// Pairing requests waiting for an answer at the same time; more are declined.
 const MAX_PENDING_PAIRS: usize = 3;
+/// How long before offering a device the same update again.
+const UPDATE_RETRY: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug)]
 struct PendingPair {
@@ -197,6 +203,7 @@ impl Service {
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
             layout_sent: Default::default(),
+            update_offers: Default::default(),
             monitors: local_monitors(),
             visit: None,
             late_drag_tx,
@@ -235,6 +242,7 @@ impl Service {
                     for handle in handles {
                         self.broadcast_client(handle);
                         self.share_layout_on_connect(handle);
+                        self.offer_update(handle);
                     }
                 }
                 _ = monitor_check.tick() => {
@@ -256,6 +264,10 @@ impl Service {
                 _ = discovery_changed(&mut self.discovery) => {
                     self.update_announced_ips();
                     self.broadcast_discovered();
+                    // what it runs on may only be known now
+                    for handle in self.client_manager.active_clients() {
+                        self.offer_update(handle);
+                    }
                 }
                 _ = self.config.changed() => self.handle_config_change(),
                 reason = termination() => {
@@ -593,6 +605,26 @@ impl Service {
 
     fn handle_control_event(&mut self, event: ControlEvent) {
         match event {
+            ControlEvent::Updated { version } => {
+                log::info!("restarting to run the update {version}");
+                update::restart_app();
+                // macOS starts the service again, from the new app
+                tokio::task::spawn_local(async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    std::process::exit(0);
+                });
+            }
+            ControlEvent::UpdateSent {
+                fingerprint,
+                version,
+                result,
+            } => {
+                let name = self.device_name(&fingerprint);
+                match result {
+                    Ok(()) => log::info!("sent the update {version} to {name}"),
+                    Err(e) => log::warn!("{name} did not take the update {version}: {e}"),
+                }
+            }
             ControlEvent::Request {
                 fingerprint,
                 request,
@@ -1126,6 +1158,58 @@ impl Service {
                 self.layout_sent.remove(&handle);
             }
         }
+    }
+
+    /// Send a connected Mac the newest build for it, if it runs another
+    /// version: Macs are updated from here instead of by hand. Offered once
+    /// per version and device every [`UPDATE_RETRY`].
+    fn offer_update(&mut self, handle: ClientHandle) {
+        let Some(fingerprint) = self.client_fingerprint(handle) else {
+            return;
+        };
+        let Some(peer) = self.discovery.as_ref().and_then(|d| d.get(&fingerprint)) else {
+            return;
+        };
+        if peer.os != "macos" {
+            return;
+        }
+        let Some((zip, version)) = update::mac_build(&peer.arch) else {
+            return;
+        };
+        // its version, once it said (right after connecting)
+        let Some(running) = self
+            .client_manager
+            .get_state(handle)
+            .and_then(|(_, s)| s.peer_commit)
+            .map(|c| String::from_utf8_lossy(&c).into_owned())
+        else {
+            return;
+        };
+        if version.starts_with(&running) || running.starts_with(&version) {
+            return;
+        }
+        if let Some((offered, at)) = self.update_offers.get(&fingerprint) {
+            if *offered == version && at.elapsed() < UPDATE_RETRY {
+                return;
+            }
+        }
+        let (Some(control), Some(&ip)) = (&self.control, peer.ips.first()) else {
+            return;
+        };
+        log::info!(
+            "sending {} the update {version} (it runs {running})",
+            peer.name
+        );
+        self.update_offers.insert(
+            fingerprint.clone(),
+            (version.clone(), std::time::Instant::now()),
+        );
+        control.send_update(
+            Destination::Addr(SocketAddr::new(ip, peer.port)),
+            fingerprint,
+            zip,
+            version,
+        );
     }
 
     /// Tell connected devices when our monitors changed.

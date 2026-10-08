@@ -345,6 +345,12 @@ pub struct DiscoveredPeer {
     pub port: u16,
     /// whether this device's fingerprint is already authorized
     pub paired: bool,
+    /// its system and processor, as Rust names them ("macos", "aarch64");
+    /// empty from older versions
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub arch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -43,7 +43,7 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use webrtc_dtls::crypto::Certificate;
 
-use crate::{clipboard, crypto, transfer};
+use crate::{clipboard, crypto, transfer, update};
 
 /// Largest message accepted or sent.
 const MAX_SIZE: usize = 16 * 1024 * 1024;
@@ -212,6 +212,15 @@ pub(crate) enum ControlEvent {
     Layout { fingerprint: String, layout: Layout },
     /// Files are being sent or received (`name` is left empty).
     Transfer(TransferUpdate),
+    /// An update from a paired device was installed: the service has to
+    /// restart to run it.
+    Updated { version: String },
+    /// Sending an update to a paired device ended (see [`Control::send_update`]).
+    UpdateSent {
+        fingerprint: String,
+        version: String,
+        result: Result<(), String>,
+    },
     /// A pairing started with [`Control::pair`] completed.
     Finished {
         fingerprint: String,
@@ -490,6 +499,55 @@ impl Control {
         });
     }
 
+    /// Send the build `zip` (Lan Mouse `version`) to the paired device at
+    /// `destination` with this `fingerprint`, which installs it if signed
+    /// like its own; the outcome comes as [`ControlEvent::UpdateSent`].
+    pub(crate) fn send_update(
+        &self,
+        destination: Destination,
+        fingerprint: String,
+        zip: std::path::PathBuf,
+        version: String,
+    ) {
+        let connector = self.connector.clone();
+        let authorized_keys = self.authorized_keys.clone();
+        let event_tx = self.event_tx.clone();
+        spawn_local(async move {
+            let sending = async {
+                let selection = tokio::task::spawn_blocking(move || transfer::select(&[zip]))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+                let addr = destination.resolve().await?;
+                let (mut tls, peer) = connect(&connector, addr).await.map_err(|e| e.to_string())?;
+                if peer != fingerprint {
+                    return Err(ControlError::WrongPeer(peer).to_string());
+                }
+                check_authorized(&peer, &authorized_keys).map_err(|e| e.to_string())?;
+                let offer = transfer::Offer {
+                    id: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_nanos() as u64),
+                    entries: selection.entries.clone(),
+                    on_drop: false,
+                    release_drops: false,
+                    update: Some(version.clone()),
+                };
+                transfer::send_offer(&mut tls, offer, &selection, None, |_| {})
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let _ = tls.shutdown().await;
+                Ok::<_, String>(())
+            };
+            let result = sending.await;
+            let _ = event_tx.send(ControlEvent::UpdateSent {
+                fingerprint,
+                version,
+                result,
+            });
+        });
+    }
+
     /// Ask the device at `addr`, whose certificate must match `fingerprint`,
     /// to pair; it will sit at `pos` relative to this one.
     ///
@@ -616,7 +674,13 @@ impl Handler {
                 Ok(())
             }
             transfer::KIND_OFFER => {
-                self.receive_files(tls, &payload, fingerprint, addr).await;
+                let update = serde_json::from_slice::<transfer::Offer>(&payload)
+                    .ok()
+                    .and_then(|o| o.update);
+                match update {
+                    Some(version) => self.receive_update(tls, &payload, version, addr).await,
+                    None => self.receive_files(tls, &payload, fingerprint, addr).await,
+                }
                 Ok(())
             }
             KIND_LAYOUT => {
@@ -745,6 +809,50 @@ impl Handler {
             0
         };
         let _ = self.event_tx.send(update(state, done));
+    }
+
+    /// Receive a build of Lan Mouse from a paired device and install it, if
+    /// signed like this one (see [`crate::update`]).
+    async fn receive_update<S>(&self, tls: &mut S, offer: &[u8], version: String, addr: SocketAddr)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let refuse = |reason: String| {
+            log::info!("not installing the update {version} from {addr}: {reason}");
+            std::future::ready(())
+        };
+        if !cfg!(target_os = "macos") {
+            transfer::refuse_offer(tls, "this device updates itself another way").await;
+            return refuse("not a Mac".into()).await;
+        }
+        if update::is_current(&version) {
+            transfer::refuse_offer(tls, "already up to date").await;
+            return refuse("already running it".into()).await;
+        }
+        let Some(dir) = update::staging_dir() else {
+            transfer::refuse_offer(tls, "no place to put it").await;
+            return refuse("no home folder".into()).await;
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        log::info!("receiving the update {version} from {addr}");
+        let saved = match transfer::receive(tls, offer, &dir, None, |_| {}).await {
+            Ok(saved) => saved,
+            Err(e) => return refuse(e.to_string()).await,
+        };
+        let Some(zip) = saved.into_iter().next() else {
+            return refuse("nothing arrived".into()).await;
+        };
+        let installed = tokio::task::spawn_blocking(move || update::install(&zip))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+        match installed {
+            Ok(()) => {
+                log::info!("installed the update {version} from {addr}");
+                let _ = self.event_tx.send(ControlEvent::Updated { version });
+            }
+            Err(e) => refuse(e).await,
+        }
     }
 
     /// Allow a pairing code exchange if fewer than [`MAX_EXCHANGES`] started
@@ -1276,6 +1384,61 @@ mod tests {
                     .handle(&mut server, "stranger".to_owned(), addr)
                     .await;
                 assert!(matches!(result, Err(ControlError::Unauthorized(_))));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn only_macs_take_updates_and_never_as_downloads() {
+        LocalSet::new()
+            .run_until(async {
+                let (event_tx, _event_rx) = channel();
+                let handler = Handler {
+                    own_fingerprint: "me".to_owned(),
+                    exchanges: Default::default(),
+                    authorized_keys: Arc::new(RwLock::new(HashMap::from([(
+                        "friend".to_owned(),
+                        "Friend".to_owned(),
+                    )]))),
+                    clipboard_enabled: Rc::new(Cell::new(true)),
+                    peer_clipboard: Default::default(),
+                    event_tx,
+                };
+                let offer = transfer::Offer {
+                    id: 99,
+                    entries: vec![transfer::Entry {
+                        path: "lan-mouse-update-test-99.zip".to_owned(),
+                        kind: transfer::EntryKind::File,
+                        size: 3,
+                    }],
+                    on_drop: false,
+                    release_drops: false,
+                    update: Some("abcdef12".to_owned()),
+                };
+                let (mut client, mut server) = duplex(64 * 1024);
+                write_frame(
+                    &mut client,
+                    transfer::KIND_OFFER,
+                    &serde_json::to_vec(&offer).unwrap(),
+                )
+                .await
+                .expect("write");
+                let addr = SocketAddr::new([127, 0, 0, 1].into(), 1);
+                handler
+                    .handle(&mut server, "friend".to_owned(), addr)
+                    .await
+                    .expect("handled");
+                let (kind, _) = transfer::read_frame(&mut client, 64 * 1024)
+                    .await
+                    .expect("answer");
+                if cfg!(target_os = "macos") {
+                    return;
+                }
+                // turned down, and not saved for the user either
+                assert_eq!(kind, transfer::KIND_REFUSE);
+                if let Some(downloads) = transfer::downloads_dir() {
+                    assert!(!downloads.join("lan-mouse-update-test-99.zip").exists());
+                }
             })
             .await;
     }

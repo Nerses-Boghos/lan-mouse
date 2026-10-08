@@ -40,7 +40,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub(crate) const KIND_OFFER: u8 = 10;
 const KIND_ACCEPT: u8 = 11;
-const KIND_REFUSE: u8 = 12;
+pub(crate) const KIND_REFUSE: u8 = 12;
 const KIND_CHUNK: u8 = 13;
 const KIND_END: u8 = 14;
 const KIND_DONE: u8 = 15;
@@ -128,6 +128,10 @@ pub(crate) struct Offer {
     /// right after (see [`RELEASE_GRACE`]).
     #[serde(default)]
     pub(crate) release_drops: bool,
+    /// Not files for the user: a build of Lan Mouse itself, of this version,
+    /// for the receiver to check and install (see [`crate::update`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) update: Option<String>,
 }
 
 impl Offer {
@@ -446,6 +450,16 @@ async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, error: &TransferError) {
     let _ = stream.flush().await;
 }
 
+/// Turn down an offer without reading it further, saying why.
+pub(crate) async fn refuse_offer<S: AsyncWrite + Unpin>(stream: &mut S, reason: &str) {
+    let reason = serde_json::to_vec(&Refusal {
+        reason: reason.to_owned(),
+    })
+    .unwrap_or_default();
+    let _ = write_frame(stream, KIND_REFUSE, &reason).await;
+    let _ = stream.flush().await;
+}
+
 fn refusal(payload: &[u8]) -> TransferError {
     let reason = serde_json::from_slice::<Refusal>(payload)
         .map(|r| r.reason)
@@ -487,7 +501,7 @@ pub(crate) async fn send<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     id: u64,
     selection: &Selection,
-    mut drag: Option<DragOutcome>,
+    drag: Option<DragOutcome>,
     release_drops: bool,
     progress: impl FnMut(Progress),
 ) -> Result<(), TransferError> {
@@ -496,7 +510,20 @@ pub(crate) async fn send<S: AsyncRead + AsyncWrite + Unpin>(
         entries: selection.entries.clone(),
         on_drop: drag.is_some(),
         release_drops: release_drops && drag.is_some(),
+        update: None,
     };
+    send_offer(stream, offer, selection, drag, progress).await
+}
+
+/// [`send`], with the offer made already (e.g. for an update).
+pub(crate) async fn send_offer<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    offer: Offer,
+    selection: &Selection,
+    mut drag: Option<DragOutcome>,
+    progress: impl FnMut(Progress),
+) -> Result<(), TransferError> {
+    let id = offer.id;
     let (files, total) = (offer.files(), offer.total_bytes());
     let mut reporter = Reporter {
         report: progress,
@@ -937,6 +964,7 @@ mod tests {
             entries: vec![entry("a"), entry("a")],
             on_drop: false,
             release_drops: false,
+            update: None,
         };
         assert!(check_offer(&offer).is_err());
     }
@@ -1033,6 +1061,7 @@ mod tests {
                 entries: selection.entries.clone(),
                 on_drop: false,
                 release_drops: false,
+                update: None,
             };
             write_frame(&mut a, KIND_OFFER, &serde_json::to_vec(&offer).unwrap())
                 .await
@@ -1068,6 +1097,7 @@ mod tests {
                     kind: EntryKind::File,
                     size: 4,
                 }],
+                update: None,
             };
             write_frame(&mut a, KIND_OFFER, &serde_json::to_vec(&offer).unwrap())
                 .await
@@ -1104,6 +1134,7 @@ mod tests {
                 kind: EntryKind::File,
                 size: 1,
             }],
+            update: None,
         };
         let payload = serde_json::to_vec(&offer).unwrap();
         let receiver = receive(&mut b, &payload, &dest, None, |_| {});

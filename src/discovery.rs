@@ -211,6 +211,8 @@ impl Discovery {
                     ips,
                     port: info.get_port(),
                     paired: false,
+                    os: info.get_property_val_str("os").unwrap_or("").to_owned(),
+                    arch: info.get_property_val_str("arch").unwrap_or("").to_owned(),
                 };
                 let changed = self.peers.get(fullname) != Some(&peer);
                 if changed {
@@ -252,6 +254,8 @@ fn announcement(
         ("v", PROTOCOL_VERSION),
         ("host", host),
         ("name", name),
+        ("os", std::env::consts::OS),
+        ("arch", std::env::consts::ARCH),
     ];
     let label = announced_host_label(fingerprint);
     let own_host = format!("{label}.local.");

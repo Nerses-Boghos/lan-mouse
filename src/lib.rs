@@ -15,3 +15,4 @@ pub mod exit_shortcut;
 mod listen;
 pub mod service;
 mod transfer;
+mod update;
