@@ -86,7 +86,11 @@ impl Dispatch<WlDataDevice, ()> for State {
                 offer.set_actions(DndAction::Copy, DndAction::Copy);
                 state.offer = Some(offer);
             }
+            wl_data_device::Event::Enter { id: None, .. } => {
+                println!("drag entered without an offer")
+            }
             wl_data_device::Event::Leave => println!("drag left"),
+            wl_data_device::Event::Motion { .. } => {}
             wl_data_device::Event::Drop => {
                 println!("dropped");
                 if let Some(offer) = state.offer.take() {
