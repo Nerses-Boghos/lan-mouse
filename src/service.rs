@@ -547,10 +547,15 @@ impl Service {
                 }
                 self.notify_frontend(FrontendEvent::Controlling(Some(handle)));
                 self.spawn_hook_command(handle, HookKind::Enter);
+                // copied files and images only where they're understood
+                let rich = self
+                    .client_fingerprint(handle)
+                    .and_then(|fp| self.discovery.as_ref()?.get(&fp))
+                    .is_some_and(|p| p.features.iter().any(|f| f == discovery::CLIPBOARD_FILES));
                 if let (Some(control), Some(addr)) =
                     (&self.control, self.client_manager.active_addr(handle))
                 {
-                    control.send_clipboard(addr);
+                    control.send_clipboard(addr, rich);
                 }
             }
             ICaptureEvent::PrimaryReleased(handle) => {

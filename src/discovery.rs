@@ -19,6 +19,12 @@ use tokio::time::Sleep;
 use mdns_sd::{DaemonEvent, IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
+/// What this version can do that older ones can't, announced so others only
+/// ask for it where it works: "clipboard-files" takes copied files and
+/// images; "update" takes updates; "log" sends its log.
+pub(crate) const FEATURES: &str = "clipboard-files,update,log";
+pub(crate) const CLIPBOARD_FILES: &str = "clipboard-files";
+
 /// Bump when the pairing / control protocol changes incompatibly.
 const PROTOCOL_VERSION: &str = "4";
 
@@ -213,6 +219,13 @@ impl Discovery {
                     paired: false,
                     os: info.get_property_val_str("os").unwrap_or("").to_owned(),
                     arch: info.get_property_val_str("arch").unwrap_or("").to_owned(),
+                    features: info
+                        .get_property_val_str("features")
+                        .unwrap_or("")
+                        .split(',')
+                        .filter(|f| !f.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
                 };
                 let changed = self.peers.get(fullname) != Some(&peer);
                 if changed {
@@ -256,6 +269,7 @@ fn announcement(
         ("name", name),
         ("os", std::env::consts::OS),
         ("arch", std::env::consts::ARCH),
+        ("features", FEATURES),
     ];
     let label = announced_host_label(fingerprint);
     let own_host = format!("{label}.local.");

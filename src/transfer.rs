@@ -132,6 +132,10 @@ pub(crate) struct Offer {
     /// for the receiver to check and install (see [`crate::update`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) update: Option<String>,
+    /// Files copied on the sender, for the receiver's clipboard: kept out of
+    /// sight, ready to paste.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) clipboard: bool,
 }
 
 impl Offer {
@@ -511,6 +515,7 @@ pub(crate) async fn send<S: AsyncRead + AsyncWrite + Unpin>(
         on_drop: drag.is_some(),
         release_drops: release_drops && drag.is_some(),
         update: None,
+        clipboard: false,
     };
     send_offer(stream, offer, selection, drag, progress).await
 }
@@ -965,6 +970,7 @@ mod tests {
             on_drop: false,
             release_drops: false,
             update: None,
+            clipboard: false,
         };
         assert!(check_offer(&offer).is_err());
     }
@@ -1062,6 +1068,7 @@ mod tests {
                 on_drop: false,
                 release_drops: false,
                 update: None,
+                clipboard: false,
             };
             write_frame(&mut a, KIND_OFFER, &serde_json::to_vec(&offer).unwrap())
                 .await
@@ -1098,6 +1105,7 @@ mod tests {
                     size: 4,
                 }],
                 update: None,
+                clipboard: false,
             };
             write_frame(&mut a, KIND_OFFER, &serde_json::to_vec(&offer).unwrap())
                 .await
@@ -1135,6 +1143,7 @@ mod tests {
                 size: 1,
             }],
             update: None,
+            clipboard: false,
         };
         let payload = serde_json::to_vec(&offer).unwrap();
         let receiver = receive(&mut b, &payload, &dest, None, |_| {});

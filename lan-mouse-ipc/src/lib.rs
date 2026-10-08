@@ -358,6 +358,9 @@ pub struct DiscoveredPeer {
     pub os: String,
     #[serde(default)]
     pub arch: String,
+    /// what it can do beyond the basics, see `FEATURES` in the engine
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

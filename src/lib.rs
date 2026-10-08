@@ -14,6 +14,8 @@ mod emulation;
 pub mod emulation_test;
 pub mod exit_shortcut;
 mod listen;
+#[cfg(target_os = "macos")]
+mod pasteboard;
 pub mod service;
 mod transfer;
 mod update;

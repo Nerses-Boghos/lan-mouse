@@ -43,7 +43,22 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use webrtc_dtls::crypto::Certificate;
 
-use crate::{clipboard, crypto, transfer, update};
+use crate::{
+    clipboard::{self, Clip},
+    crypto, transfer, update,
+};
+
+/// Where files copied on another device are kept, ready to paste.
+fn clipboard_files_dir() -> Option<std::path::PathBuf> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    if cfg!(target_os = "macos") {
+        return Some(home.join("Library/Caches/lan-mouse-clipboard"));
+    }
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".cache"));
+    Some(cache.join("lan-mouse").join("clipboard"))
+}
 
 /// Largest message accepted or sent.
 const MAX_SIZE: usize = 16 * 1024 * 1024;
@@ -72,6 +87,11 @@ const KIND_LAYOUT: u8 = 9;
 const KIND_LOG_REQUEST: u8 = 18;
 /// The answer to [`KIND_LOG_REQUEST`].
 const KIND_LOG: u8 = 19;
+/// A copied image (PNG) for the receiver's clipboard.
+const KIND_CLIPBOARD_IMAGE: u8 = 20;
+/// Most copied files sent along at a crossing; more would hold up every
+/// crossing (dragging still carries them).
+const MAX_CLIPBOARD_FILES: u64 = 512 * 1024 * 1024;
 
 /// Largest [`Layout`] accepted: a few monitors are a few hundred bytes.
 const MAX_LAYOUT_SIZE: usize = 64 * 1024;
@@ -340,7 +360,10 @@ impl Control {
 
     /// Send the local clipboard to `addr` in the background, unless that peer
     /// already has exactly this content.
-    pub(crate) fn send_clipboard(&self, addr: SocketAddr) {
+    /// Send the clipboard to the paired device at `addr`, unless it has it
+    /// already. Copied files and images only go where the device said it
+    /// takes them (`rich`); older versions would save them as downloads.
+    pub(crate) fn send_clipboard(&self, addr: SocketAddr, rich: bool) {
         if !self.clipboard_enabled.get() {
             return;
         }
@@ -348,15 +371,19 @@ impl Control {
         let authorized_keys = self.authorized_keys.clone();
         let peer_clipboard = self.peer_clipboard.clone();
         spawn_local(async move {
-            let text = match clipboard::read().await {
-                Ok(Some(text)) if !text.is_empty() => text,
-                Ok(_) => return,
+            let clip = match clipboard::read().await {
+                Ok(Some(Clip::Text(text))) if text.is_empty() => return,
+                Ok(Some(clip)) => clip,
+                Ok(None) => return,
                 Err(e) => {
                     log::warn!("could not read clipboard: {e}");
                     return;
                 }
             };
-            let hash = digest(&text);
+            if !rich && !matches!(clip, Clip::Text(_)) {
+                return;
+            }
+            let hash = clip.digest();
             // Skip resending what the peer got moments ago (crossing back and
             // forth). Only briefly: it may have copied something else since.
             if peer_clipboard
@@ -366,21 +393,71 @@ impl Control {
             {
                 return;
             }
-            let transfer = async {
-                let (mut tls, fingerprint) = connect(&connector, addr).await?;
-                check_authorized(&fingerprint, &authorized_keys)?;
-                write_frame(&mut tls, KIND_CLIPBOARD, &text).await?;
-                tls.shutdown().await?;
-                Ok::<_, ControlError>(())
+            let what = match &clip {
+                Clip::Text(text) => format!("clipboard ({} bytes)", text.len()),
+                Clip::Image(png) => format!("copied image ({} bytes)", png.len()),
+                Clip::Files(paths) => format!("{} copied files", paths.len()),
             };
-            match timeout(TIMEOUT, transfer).await {
+            let transfer = async {
+                let (mut tls, fingerprint) =
+                    connect(&connector, addr).await.map_err(|e| e.to_string())?;
+                check_authorized(&fingerprint, &authorized_keys).map_err(|e| e.to_string())?;
+                match &clip {
+                    Clip::Text(text) => timeout(TIMEOUT, async {
+                        write_frame(&mut tls, KIND_CLIPBOARD, text).await?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?,
+                    Clip::Image(png) if png.len() > MAX_SIZE => {
+                        return Err("the image is too big".to_owned());
+                    }
+                    Clip::Image(png) => timeout(TIMEOUT * 4, async {
+                        write_frame(&mut tls, KIND_CLIPBOARD_IMAGE, png).await?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?,
+                    Clip::Files(paths) => {
+                        let paths = paths.clone();
+                        let selection =
+                            tokio::task::spawn_blocking(move || transfer::select(&paths))
+                                .await
+                                .map_err(|e| e.to_string())?
+                                .map_err(|e| e.to_string())?;
+                        let total: u64 = selection.entries.iter().map(|e| e.size).sum();
+                        if total > MAX_CLIPBOARD_FILES {
+                            return Err(format!(
+                                "{} MB is too much to send along; drag them instead",
+                                total / 1_000_000
+                            ));
+                        }
+                        let offer = transfer::Offer {
+                            id: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_nanos() as u64),
+                            entries: selection.entries.clone(),
+                            on_drop: false,
+                            release_drops: false,
+                            update: None,
+                            clipboard: true,
+                        };
+                        transfer::send_offer(&mut tls, offer, &selection, None, |_| {})
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                let _ = tls.shutdown().await;
+                Ok::<_, String>(())
+            };
+            match transfer.await {
                 Ok(()) => {
-                    log::info!("sent clipboard ({} bytes) to {addr}", text.len());
+                    log::info!("sent {what} to {addr}");
                     peer_clipboard
                         .borrow_mut()
                         .insert(addr.ip(), (hash, Instant::now()));
                 }
-                Err(e) => log::warn!("could not send clipboard to {addr}: {e}"),
+                Err(e) => log::warn!("could not send {what} to {addr}: {e}"),
             }
         });
     }
@@ -574,6 +651,7 @@ impl Control {
                     on_drop: false,
                     release_drops: false,
                     update: Some(version.clone()),
+                    clipboard: false,
                 };
                 transfer::send_offer(&mut tls, offer, &selection, None, |_| {})
                     .await
@@ -687,7 +765,13 @@ impl Handler {
         // Decide what this peer may send before reading (and allocating) it.
         let paired = check_authorized(&fingerprint, &self.authorized_keys).is_ok();
         match kind {
-            KIND_CLIPBOARD | KIND_LAYOUT | KIND_LOG_REQUEST | transfer::KIND_OFFER if !paired => {
+            KIND_CLIPBOARD
+            | KIND_CLIPBOARD_IMAGE
+            | KIND_LAYOUT
+            | KIND_LOG_REQUEST
+            | transfer::KIND_OFFER
+                if !paired =>
+            {
                 return Err(ControlError::Unauthorized(fingerprint));
             }
             KIND_LAYOUT if len > MAX_LAYOUT_SIZE => return Err(ControlError::TooLarge(len)),
@@ -695,6 +779,7 @@ impl Handler {
                 return Err(ControlError::TooLarge(len));
             }
             KIND_CLIPBOARD
+            | KIND_CLIPBOARD_IMAGE
             | KIND_LAYOUT
             | KIND_LOG_REQUEST
             | KIND_PAIR_REQUEST
@@ -713,18 +798,36 @@ impl Handler {
                 }
                 timeout(TIMEOUT, async { Ok(clipboard::write(&payload).await?) }).await?;
                 // the sender has this content now, no need to send it back
-                self.peer_clipboard
-                    .borrow_mut()
-                    .insert(addr.ip(), (digest(&payload), Instant::now()));
+                self.remember_received(addr, &Clip::Text(payload.clone()));
                 log::info!("received clipboard ({} bytes) from {addr}", payload.len());
+                Ok(())
+            }
+            KIND_CLIPBOARD_IMAGE => {
+                if !self.clipboard_enabled.get() {
+                    return Ok(());
+                }
+                timeout(TIMEOUT, async {
+                    Ok(clipboard::write_image(&payload).await?)
+                })
+                .await?;
+                self.remember_received(addr, &Clip::Image(payload.clone()));
+                log::info!(
+                    "received a copied image ({} bytes) from {addr}",
+                    payload.len()
+                );
                 Ok(())
             }
             transfer::KIND_OFFER => {
                 let update = serde_json::from_slice::<transfer::Offer>(&payload)
                     .ok()
                     .and_then(|o| o.update);
+                let for_clipboard =
+                    serde_json::from_slice::<transfer::Offer>(&payload).is_ok_and(|o| o.clipboard);
                 match update {
                     Some(version) => self.receive_update(tls, &payload, version, addr).await,
+                    None if for_clipboard => {
+                        self.receive_clipboard_files(tls, &payload, addr).await
+                    }
                     None => self.receive_files(tls, &payload, fingerprint, addr).await,
                 }
                 Ok(())
@@ -864,6 +967,46 @@ impl Handler {
             0
         };
         let _ = self.event_tx.send(update(state, done));
+    }
+
+    /// What arrived from `addr` is on the clipboard now: don't send it back.
+    fn remember_received(&self, addr: SocketAddr, clip: &Clip) {
+        self.peer_clipboard
+            .borrow_mut()
+            .insert(addr.ip(), (clip.digest(), Instant::now()));
+    }
+
+    /// Receive files copied on a paired device, out of sight, and put them on
+    /// the clipboard ready to paste.
+    async fn receive_clipboard_files<S>(&self, tls: &mut S, offer: &[u8], addr: SocketAddr)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let dir = match clipboard_files_dir() {
+            Some(dir) if self.clipboard_enabled.get() => dir,
+            _ => {
+                transfer::refuse_offer(tls, "this device doesn't share the clipboard").await;
+                return;
+            }
+        };
+        // only the latest copy is kept
+        let _ = std::fs::remove_dir_all(&dir);
+        let saved = match transfer::receive(tls, offer, &dir, None, |_| {}).await {
+            Ok(saved) => saved,
+            Err(e) => {
+                log::warn!("copied files from {addr} didn't arrive: {e}");
+                return;
+            }
+        };
+        let count = saved.len();
+        let clip = Clip::Files(saved);
+        match clipboard::write_clip(&clip).await {
+            Ok(()) => {
+                self.remember_received(addr, &clip);
+                log::info!("received {count} copied files from {addr}");
+            }
+            Err(e) => log::warn!("could not put the copied files on the clipboard: {e}"),
+        }
     }
 
     /// Receive a build of Lan Mouse from a paired device and install it, if
@@ -1029,9 +1172,6 @@ async fn read_frame<S: AsyncRead + Unpin>(
     }
 }
 
-fn digest(data: &[u8]) -> [u8; 32] {
-    Sha256::digest(data).into()
-}
 
 fn peer_fingerprint(certs: Option<&[CertificateDer<'_>]>) -> String {
     certs
@@ -1469,6 +1609,7 @@ mod tests {
                     on_drop: false,
                     release_drops: false,
                     update: Some("abcdef12".to_owned()),
+                    clipboard: false,
                 };
                 let (mut client, mut server) = duplex(64 * 1024);
                 write_frame(
@@ -1496,6 +1637,55 @@ mod tests {
                 }
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn copied_files_arrive_out_of_sight() {
+        let base = std::env::temp_dir().join(format!("lm-clip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/note.txt"), b"copied").unwrap();
+        // SAFETY: no other test reads where copied files go
+        unsafe { std::env::set_var("XDG_CACHE_HOME", base.join("cache")) };
+        LocalSet::new()
+            .run_until(async {
+                let (event_tx, _event_rx) = channel();
+                let handler = Handler {
+                    own_fingerprint: "me".to_owned(),
+                    exchanges: Default::default(),
+                    authorized_keys: Arc::new(RwLock::new(HashMap::from([(
+                        "friend".to_owned(),
+                        "Friend".to_owned(),
+                    )]))),
+                    clipboard_enabled: Rc::new(Cell::new(true)),
+                    peer_clipboard: Default::default(),
+                    event_tx,
+                };
+                let selection = transfer::select(&[base.join("src/note.txt")]).unwrap();
+                let offer = transfer::Offer {
+                    id: 3,
+                    entries: selection.entries.clone(),
+                    on_drop: false,
+                    release_drops: false,
+                    update: None,
+                    clipboard: true,
+                };
+                let (mut client, mut server) = duplex(64 * 1024);
+                let addr = SocketAddr::new([127, 0, 0, 1].into(), 1);
+                let sending = transfer::send_offer(&mut client, offer, &selection, None, |_| {});
+                let receiving = handler.handle(&mut server, "friend".to_owned(), addr);
+                let (sent, received) = tokio::join!(sending, receiving);
+                sent.expect("sent");
+                received.expect("received");
+            })
+            .await;
+        let kept = base.join("cache/lan-mouse/clipboard/note.txt");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"copied");
+        // not in Downloads
+        if let Some(downloads) = transfer::downloads_dir() {
+            assert!(!downloads.join("note.txt").exists() || base.starts_with(&downloads));
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
